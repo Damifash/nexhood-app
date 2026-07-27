@@ -5,7 +5,7 @@
 #
 # You'll still be prompted to fill in the "sync: false" secrets once in the
 # dashboard (Render won't let you commit real secrets into a yaml file, for
-# good reason) — MONGODB_URI, your Resend API key, and your Termii API key.
+# good reason) — MONGODB_URI and your Resend API key.
 
 services:
   - type: web
@@ -17,6 +17,8 @@ services:
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
       - key: MONGODB_URI
         sync: false
       - key: JWT_SECRET
@@ -27,9 +29,5 @@ services:
         sync: false
       - key: FRONTEND_URL
         sync: false
-      - key: TERMII_API_KEY
-        sync: false
-      - key: TERMII_SENDER_ID
-        sync: false
-      - key: POLICE_PHONE
+      - key: POLICE_EMAIL
         sync: false
