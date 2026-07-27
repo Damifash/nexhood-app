@@ -1,0 +1,14 @@
+fastapi==0.95.0
+uvicorn==0.20.0
+pymongo==4.3.3
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+resend==2.5.1
+requests==2.32.3
+pyotp==2.8.0
+qrcode==7.4.2
+python-socketio==5.8.0
+fastapi-limiter==0.1.5
+redis==5.0.1
+pytest==7.4.0
+python-dotenv==1.0.0

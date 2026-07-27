@@ -1,0 +1,12 @@
+# Never commit these — venv is machine-specific and huge, .env has real secrets.
+venv/
+.venv/
+env/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+
+# If you're pushing the frontend from the same repo:
+node_modules/
+dist/
