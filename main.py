@@ -198,9 +198,9 @@ class UserResponse(BaseModel):
     email: EmailStr
     phone: str
     role: str
-    estate_id: Optional[str]
+    estate_id: Optional[str] = None
     estate_name: Optional[str] = None
-    apartment: Optional[str]
+    apartment: Optional[str] = None
     is_active: bool
     last_seen: datetime
     created_at: datetime
