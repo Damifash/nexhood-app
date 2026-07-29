@@ -84,12 +84,34 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="NexHood Backend", description="Backend for estate security management")
 
 # Initialize Socket.IO
-sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins=[])
+# This was set to an empty list, which blocks every origin — real-time
+# alerts/community updates over the socket.io connection would have been
+# silently broken in production even though the REST API worked fine.
+# Kept in sync with the CORSMiddleware origins above.
+sio = socketio.AsyncServer(
+    async_mode='asgi',
+    cors_allowed_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://nexhoodapp.com",
+        "https://www.nexhoodapp.com",
+    ]
+)
 
-# CORS Middleware
+# CORS Middleware — locked to real domains now that we're deploying.
+# allow_credentials=True + a literal "*" origin is actually invalid per the
+# CORS spec (browsers reject it), so that wildcard had to go anyway. The
+# regex covers Vercel's preview-deployment URLs (each PR/branch gets its
+# own random *.vercel.app subdomain) without listing them one by one.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "*"],  # tighten to your real domain before launch
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://nexhoodapp.com",
+        "https://www.nexhoodapp.com",
+    ],
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -198,9 +220,9 @@ class UserResponse(BaseModel):
     email: EmailStr
     phone: str
     role: str
-    estate_id: Optional[str] = None
+    estate_id: Optional[str]
     estate_name: Optional[str] = None
-    apartment: Optional[str] = None
+    apartment: Optional[str]
     is_active: bool
     last_seen: datetime
     created_at: datetime
