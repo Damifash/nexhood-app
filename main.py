@@ -1,4 +1,4 @@
-# NEXHOOD BACKEND BUILD MARKER: v18-2026-07-27
+# NEXHOOD BACKEND BUILD MARKER: v20-2026-07-27-pass-expiry-fix
 # If /health below doesn't return this exact build string, the running
 # process is NOT this file — kill whatever's on port 8000 and restart.
 from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Request, UploadFile, File, Body
@@ -220,9 +220,15 @@ class UserResponse(BaseModel):
     email: EmailStr
     phone: str
     role: str
-    estate_id: Optional[str]
+    # Both of these are frequently absent on freshly self-registered users
+    # (apartment isn't collected on the public form; estate_id is only
+    # sometimes pre-resolved before this model validates). In Pydantic v2,
+    # `Optional[str]` alone still means REQUIRED-but-nullable — it does NOT
+    # default to None the way it did in v1. Without an explicit `= None`
+    # here, login 500s the instant it hits a user missing either key.
+    estate_id: Optional[str] = None
     estate_name: Optional[str] = None
-    apartment: Optional[str]
+    apartment: Optional[str] = None
     is_active: bool
     last_seen: datetime
     created_at: datetime
@@ -467,7 +473,7 @@ async def location_update(sid, data):
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-BUILD_VERSION = "v18-2026-07-27"
+BUILD_VERSION = "v20-2026-07-27-pass-expiry-fix"
 
 
 @app.get("/health")
@@ -777,10 +783,16 @@ async def validate_visitor_pass(code: str, pass_data: VisitorPassValidate, curre
     valid_from = pass_data_db["valid_from"]
     valid_until = pass_data_db["valid_until"]
 
-    # 2-hour grace period to handle timezone differences (WAT vs UTC)
-    if now < valid_from - timedelta(hours=2):
+    # The frontend already converts the resident's local time to a proper
+    # UTC ISO timestamp before sending it (new Date(...).toISOString()), and
+    # Mongo stores/returns everything as naive UTC too — so there was never
+    # an actual timezone mismatch to compensate for here. The old 2-hour
+    # grace window meant a code stamped "expires 9:29" was still accepted
+    # at 11:29 — a real security gap, not a fix. A minute of slack is
+    # plenty to absorb clock drift between the browser and this server.
+    if now < valid_from - timedelta(minutes=1):
         raise HTTPException(status_code=400, detail="Pass not yet valid")
-    if now > valid_until + timedelta(hours=2):
+    if now > valid_until + timedelta(minutes=1):
         raise HTTPException(status_code=400, detail="Pass has expired")
     if pass_data_db["status"] == "used":
         raise HTTPException(status_code=400, detail="Pass already used")
