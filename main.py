@@ -1,15 +1,16 @@
-# NEXHOOD BACKEND BUILD MARKER: v20-2026-07-27-pass-expiry-fix
+# NEXHOOD BACKEND BUILD MARKER: v21-2026-07-29-profile-phone-police-donations
 # If /health below doesn't return this exact build string, the running
 # process is NOT this file — kill whatever's on port 8000 and restart.
 from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Request, UploadFile, File, Body
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, EmailStr, Field, ValidationError
+from pydantic import BaseModel, EmailStr, Field, ValidationError, field_validator
 from pymongo import MongoClient
 from bson import ObjectId
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 import os
+import re
 import qrcode
 import pyotp
 from datetime import datetime, timedelta
@@ -158,6 +159,55 @@ def send_email(to: Optional[str], subject: str, html: str) -> None:
     except Exception as e:
         logger.error(f"Resend email failed for {to}: {e}")
 
+
+def branded_email(title: str, body_html: str) -> str:
+    """Wraps every outgoing email in one consistent NexHood-branded shell —
+    invites, welcomes, alerts, police notifications, and password resets all
+    used to be bare unstyled paragraphs with no shared identity. Pass a short
+    title and the inner body HTML; this handles the header/footer chrome."""
+    return f"""
+    <div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#f4f5f7;padding:32px 16px;">
+      <div style="max-width:480px;margin:0 auto;background:#ffffff;border-radius:16px;overflow:hidden;border:1px solid #e5e7eb;">
+        <div style="background:#1e2a5e;padding:20px 28px;">
+          <span style="color:#ffffff;font-size:18px;font-weight:700;letter-spacing:0.3px;">NexHood</span>
+        </div>
+        <div style="padding:28px;">
+          <h2 style="margin:0 0 16px;color:#111827;font-size:18px;">{title}</h2>
+          <div style="color:#374151;font-size:14px;line-height:1.6;">{body_html}</div>
+        </div>
+        <div style="padding:16px 28px;background:#f9fafb;border-top:1px solid #f0f0f0;">
+          <p style="margin:0;color:#9ca3af;font-size:12px;">Estate security, made simple. Sent by NexHood — if this wasn't you, you can safely ignore this email.</p>
+        </div>
+      </div>
+    </div>
+    """
+
+
+def normalize_phone(raw: str) -> str:
+    """Accepts the way Nigerians actually type phone numbers — 08032292627,
+    8032292627, 2348032292627, or +2348032292627 — and returns E.164
+    (+234...). Previously the API only accepted a leading '+', so anyone
+    typing their number the normal local way (0803...) got rejected at
+    signup with no explanation. Falls back to a generic international check
+    for non-Nigerian numbers so this doesn't break other countries."""
+    digits = re.sub(r"[^\d+]", "", raw or "")
+    if not digits:
+        raise ValueError("Phone number is required")
+    if digits.startswith("+"):
+        candidate = digits
+    elif digits.startswith("234") and len(digits) >= 12:
+        candidate = "+" + digits
+    elif digits.startswith("0") and len(digits) == 11:
+        candidate = "+234" + digits[1:]
+    elif len(digits) == 10:
+        # Typed without the leading 0, e.g. "8032292627"
+        candidate = "+234" + digits
+    else:
+        candidate = "+" + digits
+    if not re.fullmatch(r"\+[1-9]\d{6,14}", candidate):
+        raise ValueError("Enter a valid phone number, e.g. 08012345678")
+    return candidate
+
 # Firebase placeholder
 # cred = credentials.Certificate("path/to/firebase.json")
 # firebase_admin.initialize_app(cred)
@@ -206,12 +256,22 @@ class BadgeAward(BaseModel):
 class UserCreate(BaseModel):
     name: str = Field(..., min_length=2)
     email: EmailStr
-    phone: str = Field(..., pattern=r"^\+?[1-9]\d{1,14}$")
+    # Accepts local Nigerian formats (08032292627) as well as E.164 — see
+    # normalize_phone() below, which does the actual conversion/validation.
+    phone: str = Field(...)
     password: str = Field(..., min_length=6)
     role: str = Field(..., pattern="^(resident|guard|admin|super_admin|police)$")
     estate_id: Optional[str] = None
     apartment: Optional[str] = None
     badges: List[BadgeAward] = []
+
+    @field_validator("phone")
+    @classmethod
+    def _normalize_phone(cls, v):
+        try:
+            return normalize_phone(v)
+        except ValueError as e:
+            raise ValueError(str(e))
 
 
 class UserResponse(BaseModel):
@@ -284,9 +344,43 @@ class IncidentCreate(BaseModel):
 class UserInvite(BaseModel):
     name: str = Field(..., min_length=2)
     email: EmailStr
-    phone: str = Field(..., pattern=r"^\+?[1-9]\d{1,14}$")
+    phone: str = Field(...)
     role: str = Field("resident", pattern="^(resident|guard|admin|police)$")
     apartment: Optional[str] = None
+
+    @field_validator("phone")
+    @classmethod
+    def _normalize_phone(cls, v):
+        try:
+            return normalize_phone(v)
+        except ValueError as e:
+            raise ValueError(str(e))
+
+
+class ProfileUpdate(BaseModel):
+    """Self-serve edits from Settings — deliberately a small allowlist
+    (name, phone, email, apartment). Role/estate changes stay admin-only."""
+    name: Optional[str] = Field(None, min_length=2)
+    phone: Optional[str] = None
+    email: Optional[EmailStr] = None
+    apartment: Optional[str] = None
+
+    @field_validator("phone")
+    @classmethod
+    def _normalize_phone(cls, v):
+        if v is None or not v.strip():
+            return None
+        try:
+            return normalize_phone(v)
+        except ValueError as e:
+            raise ValueError(str(e))
+
+
+class EstateProfileUpdate(BaseModel):
+    """Lets an estate admin rename their estate / fix its address from
+    Settings, without touching the police-contact settings endpoint."""
+    name: Optional[str] = Field(None, min_length=2)
+    address: Optional[str] = Field(None, min_length=5)
 
 
 class AlertCreate(BaseModel):
@@ -473,7 +567,7 @@ async def location_update(sid, data):
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-BUILD_VERSION = "v20-2026-07-27-pass-expiry-fix"
+BUILD_VERSION = "v21-2026-07-29-profile-phone-police-donations"
 
 
 @app.get("/health")
@@ -557,6 +651,26 @@ async def register(user: UserCreate):
         "timestamp": datetime.utcnow()
     })
 
+    became_admin = user_dict.get("role") == "admin"
+    send_email(
+        user.email,
+        f"Welcome to NexHood, {user.name.split(' ')[0]}!",
+        branded_email(
+            f"Welcome to {estate_name}",
+            f"<p>Hi {user.name},</p>"
+            f"<p>Your NexHood account is ready. "
+            + (
+                f"Since you're the first person to register {estate_name}, you're now this estate's admin — "
+                f"you can invite guards, residents and police, and manage everything from the dashboard."
+                if became_admin else
+                f"You're all set as a resident of {estate_name}."
+            )
+            + "</p>"
+            f"<p>From the app you can raise alerts, report incidents, issue visitor passes, and stay in the loop with what's happening around you.</p>"
+            f"<p>Glad to have you on board.</p>"
+        )
+    )
+
     return {
         "message": "Registration successful! Welcome to NexHood.",
         "token": token,
@@ -609,10 +723,14 @@ async def forgot_password(request: ForgotPasswordRequest):
         send_email(
             user["email"],
             "Reset your NexHood password",
-            f"<p>Hi {user.get('name', '')},</p>"
-            f"<p>Click the link below to reset your NexHood password. This link expires in 1 hour.</p>"
-            f"<p><a href=\"{reset_link}\">{reset_link}</a></p>"
-            f"<p>If you didn't request this, you can safely ignore this email.</p>"
+            branded_email(
+                "Reset your password",
+                f"<p>Hi {user.get('name', '')},</p>"
+                f"<p>Click the button below to reset your NexHood password. This link expires in 1 hour.</p>"
+                f"<p style='margin:20px 0;'><a href=\"{reset_link}\" style=\"background:#1e2a5e;color:#ffffff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:600;display:inline-block;\">Reset password</a></p>"
+                f"<p style='color:#9ca3af;font-size:12px;'>Or paste this link into your browser: {reset_link}</p>"
+                f"<p>If you didn't request this, you can safely ignore this email.</p>"
+            )
         )
     return {"message": "If that email is registered, a reset link has been sent."}
 
@@ -661,12 +779,39 @@ async def create_estate(estate: EstateCreate, current_user: Dict = Depends(requi
 
 @app.get("/api/estates/{estate_id}")
 async def get_estate(estate_id: str, current_user: Dict = Depends(get_current_user)):
+    """Read access: any authenticated user belonging to this estate, not
+    just the exact admin who created it. This used to reject every
+    resident/guard/police request with a 403 — silently, since the
+    frontend swallows the error — which is why things like the Alerts
+    page's police phone number (read from estate.settings) never actually
+    loaded for anyone but the admin. Only mutations stay admin-gated."""
     estate = estates_collection.find_one({"_id": ObjectId(estate_id)})
     if not estate:
         raise HTTPException(status_code=404, detail="Estate not found")
-    if current_user["role"] != "super_admin" and str(estate["admin_id"]) != str(current_user["_id"]):
+    is_member = current_user.get("estate_id") and str(current_user["estate_id"]) == estate_id
+    if current_user["role"] != "super_admin" and not is_member:
         raise HTTPException(status_code=403, detail="Access denied")
     return {"estate": to_json_serializable({**estate, "id": str(estate["_id"]), "admin_id": str(estate["admin_id"])})}
+
+
+@app.patch("/api/estates/{estate_id}")
+async def update_estate_profile(estate_id: str, update: EstateProfileUpdate, current_user: Dict = Depends(require_admin)):
+    """Admin-editable estate identity (name/address) — separate from
+    /settings above, which is for the police-contact/emergency-contact
+    block. Kept as its own small allowlisted route rather than folding into
+    /settings so the two concerns (identity vs. escalation contacts) don't
+    get tangled in one $set."""
+    if current_user["role"] != "super_admin" and str(current_user.get("estate_id")) != estate_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    changes = update.dict(exclude_unset=True, exclude_none=True)
+    if not changes:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+    estate = estates_collection.find_one({"_id": ObjectId(estate_id)})
+    if not estate:
+        raise HTTPException(status_code=404, detail="Estate not found")
+    estates_collection.update_one({"_id": ObjectId(estate_id)}, {"$set": changes})
+    updated = estates_collection.find_one({"_id": ObjectId(estate_id)})
+    return {"estate": to_json_serializable({**updated, "id": str(updated["_id"]), "admin_id": str(updated["admin_id"])})}
 
 
 # Fields an admin is allowed to self-serve edit from the Settings page.
@@ -751,11 +896,14 @@ async def create_visitor_pass(pass_data: VisitorPassCreate, current_user: Dict =
         send_email(
             pass_data.visitor_email,
             f"Your NexHood visitor pass — {pass_dict['visitor_name']}",
-            f"<p>Hi {pass_dict['visitor_name']},</p>"
-            f"<p>You've been issued a visitor pass. Your entry code is:</p>"
-            f"<p style='font-size:24px;font-weight:bold;letter-spacing:2px;'>{code}</p>"
-            f"<p>Valid from {pass_data.valid_from} to {pass_data.valid_until}.</p>"
-            f"<p>Show this code (or the QR code shared with you) to the gate guard on arrival.</p>"
+            branded_email(
+                "You've been issued a visitor pass",
+                f"<p>Hi {pass_dict['visitor_name']},</p>"
+                f"<p>Your entry code is:</p>"
+                f"<p style='font-size:26px;font-weight:bold;letter-spacing:3px;color:#1e2a5e;'>{code}</p>"
+                f"<p>Valid from {pass_data.valid_from} to {pass_data.valid_until}.</p>"
+                f"<p>Show this code (or the QR code shared with you) to the gate guard on arrival.</p>"
+            )
         )
     audit_logs_collection.insert_one({
         "user_id": ObjectId(current_user["_id"]),
@@ -853,9 +1001,12 @@ async def create_incident(incident: IncidentCreate, current_user: Dict = Depends
             send_email(
                 admin.get("email"),
                 f"NexHood ALERT: {incident.severity.upper()} incident reported",
-                f"<p><strong>{incident.title}</strong></p>"
-                f"<p>{incident.description}</p>"
-                f"<p>Reported by {current_user['name']}. Check the app for full details.</p>"
+                branded_email(
+                    f"{incident.severity.capitalize()} incident reported",
+                    f"<p><strong>{incident.title}</strong></p>"
+                    f"<p>{incident.description}</p>"
+                    f"<p>Reported by {current_user['name']}. Check the app for full details.</p>"
+                )
             )
     audit_logs_collection.insert_one({
         "user_id": ObjectId(current_user["_id"]),
@@ -983,9 +1134,13 @@ async def create_alert(alert: AlertCreate, current_user: Dict = Depends(get_curr
                     send_email(
                         contact["email"],
                         f"NexHood EMERGENCY ALERT ({alert.priority.upper()}): {alert.type}",
-                        f"<p>A {alert.priority} priority alert was raised at your estate.</p>"
-                        f"<p><strong>{alert.type}</strong></p>"
-                        f"<p>{alert.message or 'No details provided'}</p>"
+                        branded_email(
+                            f"{alert.priority.capitalize()} priority alert",
+                            f"<p>A {alert.priority} priority alert was raised at your estate.</p>"
+                            f"<p><strong>{alert.type.replace('_', ' ').title()}</strong></p>"
+                            f"<p>{alert.message or 'No details provided'}</p>"
+                            f"<p>Raised by {current_user.get('name', 'a resident')}.</p>"
+                        )
                     )
 
         audit_logs_collection.insert_one({
@@ -1095,54 +1250,78 @@ async def get_alerts(status: Optional[str] = None, type: Optional[str] = None, p
 
 @app.post("/api/police/integration")
 async def police_integration(data: PoliceIntegration, current_user: Dict = Depends(get_current_user)):
-    if current_user["role"] not in ["guard", "admin", "super_admin"]:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    """Any authenticated member of the estate can trigger this — a resident
+    in the middle of an emergency shouldn't have to wait on a guard/admin to
+    click a button on their behalf. Notifies two channels, since there's no
+    real SMS/dispatch integration yet: (1) the estate's configured
+    police_email/POLICE_EMAIL fallback, and (2) every active user who was
+    invited with the 'police' role for this estate, emailed directly at
+    their own NexHood login address — so a police account created here
+    actually receives something when 'Notify police' is pressed, instead of
+    that button silently going nowhere."""
+    if not current_user.get("estate_id"):
+        raise HTTPException(status_code=400, detail="No estate on this account")
     alert = alerts_collection.find_one({"_id": ObjectId(data.alert_id)})
     if not alert or str(alert["estate_id"]) != str(current_user.get("estate_id")):
         raise HTTPException(status_code=404, detail="Alert not found")
 
-    # Admin-configured per-estate address takes priority; POLICE_EMAIL env
-    # var is just the bootstrap fallback for estates that haven't set one.
     estate = estates_collection.find_one({"_id": ObjectId(current_user["estate_id"])})
     police_email = ((estate or {}).get("settings") or {}).get("police_email") or POLICE_EMAIL
+    police_users = list(users_collection.find({
+        "estate_id": ObjectId(current_user["estate_id"]),
+        "role": "police",
+        "is_active": True
+    }, {"email": 1}))
 
-    # Mock police notification — replace with a real dispatch/API integration.
-    try:
-        send_email(
-            police_email,
-            "NEXHOOD EMERGENCY",
-            f"<p><strong>Estate ID:</strong> {current_user.get('estate_id')}</p>"
-            f"<p><strong>Type:</strong> {alert.get('type')}</p>"
-            f"<p><strong>Message:</strong> {alert.get('message', 'No details provided')}</p>"
-            f"<p><strong>Location:</strong> {alert.get('location', 'Unknown')}</p>"
-            f"<p><strong>Reported by:</strong> {current_user.get('name', 'Resident')}</p>"
-        )
+    recipients = {e for e in [police_email] if e}
+    recipients.update(u["email"] for u in police_users if u.get("email"))
 
-        alerts_collection.update_one(
-            {"_id": ObjectId(data.alert_id)},
-            {"$set": {"police_status": "notified", "police_notified_at": datetime.utcnow()}}
-        )
+    body = branded_email(
+        "Emergency — action needed",
+        f"<p><strong>Estate:</strong> {estate.get('name') if estate else 'Unknown'}</p>"
+        f"<p><strong>Type:</strong> {alert.get('type', '').replace('_', ' ').title()}</p>"
+        f"<p><strong>Message:</strong> {alert.get('message', 'No details provided')}</p>"
+        f"<p><strong>Reported by:</strong> {current_user.get('name', 'A resident')} ({current_user.get('phone', 'no phone on file')})</p>"
+        f"<p>This alert was flagged for police attention via NexHood — please respond as appropriate.</p>"
+    )
 
-        await sio.emit("police_notified", {
-            "alert_id": str(data.alert_id),
-            "notified_by": current_user["name"]
-        }, room=f"estate_{current_user['estate_id']}")
+    sent_count = 0
+    for r in recipients:
+        send_email(r, "NEXHOOD EMERGENCY — Police attention needed", body)
+        sent_count += 1
 
-        audit_logs_collection.insert_one({
-            "user_id": ObjectId(current_user["_id"]),
-            "estate_id": ObjectId(current_user["estate_id"]),
-            "action": "police_notify",
-            "entity": "alert",
-            "entity_id": data.alert_id,
-            "details": {"status": "notified"},
-            "timestamp": datetime.utcnow()
-        })
+    alerts_collection.update_one(
+        {"_id": ObjectId(data.alert_id)},
+        {"$set": {"police_status": "notified", "police_notified_at": datetime.utcnow()}}
+    )
 
-        return {"message": "Emergency sent to police", "status": "notified"}
+    await sio.emit("police_notified", {
+        "alert_id": str(data.alert_id),
+        "notified_by": current_user["name"]
+    }, room=f"estate_{current_user['estate_id']}")
 
-    except Exception as e:
-        logger.error(f"Police notification failed: {e}")
-        return {"message": "Failed to notify police", "status": "failed"}
+    audit_logs_collection.insert_one({
+        "user_id": ObjectId(current_user["_id"]),
+        "estate_id": ObjectId(current_user["estate_id"]),
+        "action": "police_notify",
+        "entity": "alert",
+        "entity_id": data.alert_id,
+        "details": {"status": "notified", "recipients": sent_count},
+        "timestamp": datetime.utcnow()
+    })
+
+    if sent_count == 0:
+        return {
+            "message": "No police contact is set up for this estate yet — ask your admin to add one under Settings > Estate settings, or invite a police account.",
+            "status": "no_recipients",
+            "recipients": 0
+        }
+
+    return {
+        "message": f"Police notified ({sent_count} recipient{'s' if sent_count != 1 else ''}).",
+        "status": "notified",
+        "recipients": sent_count
+    }
 
 
 @app.get("/api/users")
@@ -1287,10 +1466,13 @@ async def single_invite(invite: UserInvite, current_user: Dict = Depends(require
     send_email(
         invite.email,
         "You've been invited to NexHood",
-        f"<p>Hi {invite.name},</p>"
-        f"<p>You've been added to NexHood as a <strong>{invite.role}</strong>.</p>"
-        f"<p>Login email: {invite.email}<br>Temporary password: <strong>{temp_password}</strong></p>"
-        f"<p>Please log in and change your password.</p>"
+        branded_email(
+            "You've been invited",
+            f"<p>Hi {invite.name},</p>"
+            f"<p>You've been added to NexHood as a <strong>{invite.role}</strong>.</p>"
+            f"<p>Login email: {invite.email}<br>Temporary password: <strong>{temp_password}</strong></p>"
+            f"<p>Please log in and change your password from Settings once you're in.</p>"
+        )
     )
 
     audit_logs_collection.insert_one({
@@ -1343,6 +1525,11 @@ async def bulk_invite_users(file: UploadFile = File(...), current_user: Dict = D
                     results.append({"email": email, "status": "skipped", "reason": "Maximum 3 admins allowed per estate"})
                     continue
                 admin_count += 1
+            try:
+                phone = normalize_phone(phone)
+            except ValueError as e:
+                results.append({"email": email, "status": "skipped", "reason": str(e)})
+                continue
             temp_password = generate_temp_password()
             hashed_password = get_password_hash(temp_password)
             user_dict = {
@@ -1367,10 +1554,13 @@ async def bulk_invite_users(file: UploadFile = File(...), current_user: Dict = D
             send_email(
                 email,
                 "You've been invited to NexHood",
-                f"<p>Hi {name},</p>"
-                f"<p>You've been added to NexHood as a <strong>{role or 'resident'}</strong>.</p>"
-                f"<p>Login email: {email}<br>Temporary password: <strong>{temp_password}</strong></p>"
-                f"<p>Please log in and change your password.</p>"
+                branded_email(
+                    "You've been invited",
+                    f"<p>Hi {name},</p>"
+                    f"<p>You've been added to NexHood as a <strong>{role or 'resident'}</strong>.</p>"
+                    f"<p>Login email: {email}<br>Temporary password: <strong>{temp_password}</strong></p>"
+                    f"<p>Please log in and change your password from Settings once you're in.</p>"
+                )
             )
             audit_logs_collection.insert_one({
                 "user_id": ObjectId(current_user["_id"]),
@@ -1457,8 +1647,10 @@ async def get_dashboard(start_date: Optional[str] = None, end_date: Optional[str
         # too, not just security events — surfaced here so admins don't have
         # to bounce between pages to see if anyone's actually engaging.
         posts_30d = posts_collection.count_documents({**estate_filter, **date_filter})
+        # Only verified donations count here — an unconfirmed pledge
+        # shouldn't show up as money the estate has actually raised.
         welfare_raised_agg = list(donations_collection.aggregate([
-            {"$match": estate_filter},
+            {"$match": {**estate_filter, "status": "verified"}},
             {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
         ]))
         welfare_raised_total = welfare_raised_agg[0]["total"] if welfare_raised_agg else 0
@@ -1658,12 +1850,19 @@ async def create_campaign(campaign: WelfareCampaignCreate, current_user: Dict = 
 async def list_campaigns(current_user: Dict = Depends(get_current_user)):
     """Every active campaign for the estate, with total_raised and
     donor_count computed live from the donations collection — there's no
-    stored running total to keep in sync, it's always derived fresh."""
+    stored running total to keep in sync, it's always derived fresh.
+
+    Only donations with status "verified" count toward total_raised/
+    donor_count. A pledge just started at checkout (status "pending") isn't
+    money in hand — there's no real Paystack webhook wired up yet to flip
+    that automatically, so it stays out of the totals until an admin
+    confirms it actually arrived (see /api/welfare/donations/pending and
+    the /verify route below)."""
     estate_id = ObjectId(current_user["estate_id"])
     campaigns = list(campaigns_collection.find({"estate_id": estate_id}).sort("created_at", -1))
 
     totals = list(donations_collection.aggregate([
-        {"$match": {"estate_id": estate_id, "campaign_id": {"$ne": None}}},
+        {"$match": {"estate_id": estate_id, "campaign_id": {"$ne": None}, "status": "verified"}},
         {"$group": {"_id": "$campaign_id", "total_raised": {"$sum": "$amount"}, "donor_count": {"$sum": 1}}}
     ]))
     totals_map = {str(t["_id"]): t for t in totals}
@@ -1684,15 +1883,14 @@ async def list_campaigns(current_user: Dict = Depends(get_current_user)):
 async def donate(donation: DonationCreate, current_user: Dict = Depends(get_current_user)):
     """IMPORTANT — this does not move real money yet. There's no Paystack
     account wired in, so the "paystack_link" below is a placeholder, not a
-    real checkout URL, and donation status never advances past "initiated"
-    because nothing calls back to confirm payment. To make this real:
-    1) get a Paystack secret key, 2) call Paystack's /transaction/initialize
-    with the amount + a callback URL to get a real authorization_url,
-    3) add a webhook route Paystack calls on success, which flips this
-    donation's status to "completed" and IS what total_raised above should
-    actually filter on once that exists. Until then, total_raised counts
-    every started donation, completed or not — good enough to show momentum
-    on a campaign, not accurate enough to reconcile actual funds raised."""
+    real checkout URL. To make this real: 1) get a Paystack secret key,
+    2) call Paystack's /transaction/initialize with the amount + a callback
+    URL to get a real authorization_url, 3) add a webhook route Paystack
+    calls on success, which should flip this donation's status to
+    "verified" automatically. Until that webhook exists, every donation
+    here sits at "pending" and an admin has to manually confirm it actually
+    arrived (via /api/welfare/donations/{id}/verify) before it counts
+    toward any total — see list_campaigns above."""
     if donation.campaign_id:
         campaign = campaigns_collection.find_one({"_id": ObjectId(donation.campaign_id)})
         if not campaign or str(campaign["estate_id"]) != str(current_user["estate_id"]):
@@ -1701,15 +1899,50 @@ async def donate(donation: DonationCreate, current_user: Dict = Depends(get_curr
     donation_dict = donation.dict(exclude={"campaign_id"})
     donation_dict.update({
         "user_id": ObjectId(current_user["_id"]),
+        "donor_name": current_user.get("name"),
         "estate_id": ObjectId(current_user["estate_id"]),
         "campaign_id": ObjectId(donation.campaign_id) if donation.campaign_id else None,
         "timestamp": datetime.utcnow(),
-        "status": "initiated"
+        "status": "pending"
     })
-    donations_collection.insert_one(donation_dict)
+    result = donations_collection.insert_one(donation_dict)
     # Mock Paystack link (replace with a real Paystack initialize call before launch)
     paystack_link = f"https://paystack.com/pay/nexhood-{donation.for_role}-{donation.amount}"
-    return {"paystack_link": paystack_link}
+    return {"paystack_link": paystack_link, "donation_id": str(result.inserted_id), "status": "pending"}
+
+
+@app.get("/api/welfare/donations/pending")
+async def list_pending_donations(current_user: Dict = Depends(require_admin)):
+    """Pledges awaiting manual confirmation — see the note on donate() above
+    about why this has to be manual for now."""
+    estate_id = ObjectId(current_user["estate_id"])
+    donations = list(donations_collection.find({"estate_id": estate_id, "status": "pending"}).sort("timestamp", -1))
+    return [serialize_doc({**d, "id": str(d["_id"])}) for d in donations]
+
+
+@app.patch("/api/welfare/donations/{donation_id}/verify")
+async def verify_donation(donation_id: str, current_user: Dict = Depends(require_admin)):
+    """Admin confirms a pledge actually arrived (bank transfer, cash, etc.)
+    — only then does it count toward a campaign's total_raised."""
+    donation = donations_collection.find_one({"_id": ObjectId(donation_id)})
+    if not donation or str(donation["estate_id"]) != str(current_user["estate_id"]):
+        raise HTTPException(status_code=404, detail="Donation not found")
+    if donation.get("status") == "verified":
+        raise HTTPException(status_code=400, detail="Already verified")
+    donations_collection.update_one(
+        {"_id": ObjectId(donation_id)},
+        {"$set": {"status": "verified", "verified_by": ObjectId(current_user["_id"]), "verified_at": datetime.utcnow()}}
+    )
+    audit_logs_collection.insert_one({
+        "user_id": ObjectId(current_user["_id"]),
+        "estate_id": ObjectId(current_user["estate_id"]),
+        "action": "verify",
+        "entity": "donation",
+        "entity_id": donation_id,
+        "details": {"amount": donation.get("amount")},
+        "timestamp": datetime.utcnow()
+    })
+    return {"message": "Donation verified"}
 
 
 MAX_UPLOAD_BYTES = 3 * 1024 * 1024  # 3MB — images are embedded straight into
@@ -1749,6 +1982,43 @@ async def get_my_profile(current_user: Dict = Depends(get_current_user)):
         estate = estates_collection.find_one({"_id": ObjectId(current_user["estate_id"])})
         if estate:
             user_data["estate_name"] = estate.get("name")
+    return user_data
+
+
+@app.patch("/api/users/me")
+async def update_my_profile(update: ProfileUpdate, current_user: Dict = Depends(get_current_user)):
+    """Self-serve profile edits — name, phone, email, apartment. Nothing
+    here touches role or estate membership; those stay admin-controlled.
+    Changing email just updates the login address on this same account, no
+    re-verification flow yet (matches how the rest of the app currently
+    trusts email at signup)."""
+    changes = update.dict(exclude_unset=True, exclude_none=True)
+    if not changes:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+
+    if "email" in changes and changes["email"].lower() != current_user["email"].lower():
+        if users_collection.find_one({"email": changes["email"], "_id": {"$ne": ObjectId(current_user["_id"])}}):
+            raise HTTPException(status_code=400, detail="That email is already in use")
+
+    users_collection.update_one({"_id": ObjectId(current_user["_id"])}, {"$set": changes})
+
+    updated = users_collection.find_one({"_id": ObjectId(current_user["_id"])})
+    user_data = serialize_doc({k: v for k, v in updated.items() if k != "password"})
+    if updated.get("estate_id"):
+        estate = estates_collection.find_one({"_id": ObjectId(updated["estate_id"])})
+        if estate:
+            user_data["estate_name"] = estate.get("name")
+
+    audit_logs_collection.insert_one({
+        "user_id": ObjectId(current_user["_id"]),
+        "estate_id": ObjectId(current_user["estate_id"]) if current_user.get("estate_id") else None,
+        "action": "update",
+        "entity": "user_profile",
+        "entity_id": str(current_user["_id"]),
+        "details": changes,
+        "timestamp": datetime.utcnow()
+    })
+
     return user_data
 
 
