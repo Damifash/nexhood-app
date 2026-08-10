@@ -1,4 +1,4 @@
-# NEXHOOD BACKEND BUILD MARKER: v21-2026-07-29-profile-phone-police-donations
+# NEXHOOD BACKEND BUILD MARKER: v22-2026-08-10-branded-logo-contact-form
 # If /health below doesn't return this exact build string, the running
 # process is NOT this file — kill whatever's on port 8000 and restart.
 from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Request, UploadFile, File, Body
@@ -130,6 +130,13 @@ RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "Nexhood <notifications@nexhoodapp.com>")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 POLICE_EMAIL = os.getenv("POLICE_EMAIL")  # fallback; admins can set per-estate in Settings
+# Where "Contact us" submissions on the landing page get emailed. Defaults to
+# the real inbox so this works out of the box even if the env var is never set.
+CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "fasoro@nexhoodapp.com")
+# Served as a static asset from the frontend (nexhood-web/public/brand/), so
+# this only resolves once FRONTEND_URL points at the real deployed site —
+# on localhost it just won't load, which is fine for local dev.
+LOGO_URL = f"{FRONTEND_URL}/brand/nexhood-mark-email.png"
 
 if RESEND_API_KEY:
     resend.api_key = RESEND_API_KEY
@@ -164,12 +171,25 @@ def branded_email(title: str, body_html: str) -> str:
     """Wraps every outgoing email in one consistent NexHood-branded shell —
     invites, welcomes, alerts, police notifications, and password resets all
     used to be bare unstyled paragraphs with no shared identity. Pass a short
-    title and the inner body HTML; this handles the header/footer chrome."""
+    title and the inner body HTML; this handles the header/footer chrome.
+
+    The logo is an <img> pointing at LOGO_URL (a static asset on the
+    deployed frontend) with the "NexHood" text right next to it — most
+    email clients block remote images by default until the recipient clicks
+    "show images," so the text can't depend on the image loading. If it
+    doesn't load, the header still reads correctly as plain text."""
     return f"""
     <div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#f4f5f7;padding:32px 16px;">
       <div style="max-width:480px;margin:0 auto;background:#ffffff;border-radius:16px;overflow:hidden;border:1px solid #e5e7eb;">
-        <div style="background:#1e2a5e;padding:20px 28px;">
-          <span style="color:#ffffff;font-size:18px;font-weight:700;letter-spacing:0.3px;">NexHood</span>
+        <div style="background:#1e2a5e;padding:18px 28px;display:flex;align-items:center;">
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>
+            <td style="vertical-align:middle;padding-right:10px;">
+              <img src="{LOGO_URL}" width="26" height="26" alt="" style="display:block;border-radius:6px;" />
+            </td>
+            <td style="vertical-align:middle;">
+              <span style="color:#ffffff;font-size:18px;font-weight:700;letter-spacing:0.3px;">NexHood</span>
+            </td>
+          </tr></table>
         </div>
         <div style="padding:28px;">
           <h2 style="margin:0 0 16px;color:#111827;font-size:18px;">{title}</h2>
@@ -225,6 +245,7 @@ try:
     posts_collection = db["posts"]
     donations_collection = db["donations"]
     campaigns_collection = db["welfare_campaigns"]
+    contact_messages_collection = db["contact_messages"]
     client.server_info()
     logger.info("Connected to MongoDB")
 except Exception as e:
@@ -436,6 +457,14 @@ class ResetPasswordRequest(BaseModel):
     new_password: str = Field(..., min_length=6)
 
 
+class ContactMessageCreate(BaseModel):
+    """The landing page 'Contact us' form — deliberately public, no auth,
+    since the whole point is reaching people who don't have an account yet."""
+    name: str = Field(..., min_length=2)
+    email: EmailStr
+    message: str = Field(..., min_length=10, max_length=3000)
+
+
 class SyncAction(BaseModel):
     id: str
     type: str = Field(..., pattern="^(validate_visitor|create_incident|create_alert)$")
@@ -567,7 +596,7 @@ async def location_update(sid, data):
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-BUILD_VERSION = "v21-2026-07-29-profile-phone-police-donations"
+BUILD_VERSION = "v22-2026-08-10-branded-logo-contact-form"
 
 
 @app.get("/health")
@@ -749,6 +778,45 @@ async def reset_password(request: ResetPasswordRequest):
         {"$set": {"password": hashed}, "$unset": {"reset_token": "", "reset_token_expires": ""}}
     )
     return {"message": "Password reset successfully. You can now log in with your new password."}
+
+
+@app.post("/api/contact")
+async def submit_contact(msg: ContactMessageCreate):
+    """Landing page 'Contact us' form. Stored in Mongo first so a message
+    is never lost even if the email send fails, then emails CONTACT_EMAIL
+    with the details and sends the person a short confirmation so they know
+    it actually went somewhere instead of vanishing into a form."""
+    doc = {
+        "name": msg.name,
+        "email": msg.email,
+        "message": msg.message,
+        "created_at": datetime.utcnow(),
+        "status": "new"
+    }
+    result = contact_messages_collection.insert_one(doc)
+
+    send_email(
+        CONTACT_EMAIL,
+        f"New Nexhood contact form message from {msg.name}",
+        branded_email(
+            "New contact form submission",
+            f"<p><strong>From:</strong> {msg.name} ({msg.email})</p>"
+            f"<p><strong>Message:</strong></p>"
+            f"<p style='white-space:pre-wrap;'>{msg.message}</p>"
+        )
+    )
+    send_email(
+        msg.email,
+        "We got your message — Nexhood",
+        branded_email(
+            "Thanks for reaching out",
+            f"<p>Hi {msg.name},</p>"
+            f"<p>Thanks for reaching out to Nexhood — we've received your message and will get back to you soon.</p>"
+            f"<p style='color:#9ca3af;font-size:12px;border-left:2px solid #e5e7eb;padding-left:10px;'>{msg.message}</p>"
+        )
+    )
+
+    return {"message": "Thanks — we've received your message and will get back to you soon.", "id": str(result.inserted_id)}
 
 
 @app.post("/api/estates")
