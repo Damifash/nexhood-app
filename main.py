@@ -144,6 +144,7 @@ ALGORITHM = "HS256"
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "Nexhood <notifications@nexhoodapp.com>")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+LOGIN_URL = f"{FRONTEND_URL}/login"
 POLICE_EMAIL = os.getenv("POLICE_EMAIL")  # fallback; admins can set per-estate in Settings
 # Where "Contact us" submissions on the landing page get emailed. Defaults to
 # the real inbox so this works out of the box even if the env var is never set.
@@ -1636,6 +1637,10 @@ async def single_invite(invite: UserInvite, current_user: Dict = Depends(require
             f"<p>Hi {invite.name},</p>"
             f"<p>You've been added to <strong>{estate_name}</strong> on NexHood as a <strong>{invite.role}</strong>.</p>"
             f"<p>Login email: {invite.email}<br>Temporary password: <strong>{temp_password}</strong></p>"
+            f"<p style=\"margin:24px 0;\"><a href=\"{LOGIN_URL}\" "
+            f"style=\"background:#1e2a5e;color:#ffffff;text-decoration:none;padding:12px 28px;"
+            f"border-radius:8px;font-weight:700;display:inline-block;\">Log in to NexHood</a></p>"
+            f"<p style=\"color:#6b7280;font-size:13px;\">Or copy this link into your browser: {LOGIN_URL}</p>"
             f"<p>Please log in and change your password from Settings once you're in.</p>"
         )
     )
@@ -1727,6 +1732,10 @@ async def bulk_invite_users(file: UploadFile = File(...), current_user: Dict = D
                     f"<p>Hi {name},</p>"
                     f"<p>You've been added to <strong>{estate_name}</strong> on NexHood as a <strong>{role or 'resident'}</strong>.</p>"
                     f"<p>Login email: {email}<br>Temporary password: <strong>{temp_password}</strong></p>"
+                    f"<p style=\"margin:24px 0;\"><a href=\"{LOGIN_URL}\" "
+                    f"style=\"background:#1e2a5e;color:#ffffff;text-decoration:none;padding:12px 28px;"
+                    f"border-radius:8px;font-weight:700;display:inline-block;\">Log in to NexHood</a></p>"
+                    f"<p style=\"color:#6b7280;font-size:13px;\">Or copy this link into your browser: {LOGIN_URL}</p>"
                     f"<p>Please log in and change your password from Settings once you're in.</p>"
                 )
             )
