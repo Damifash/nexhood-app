@@ -716,7 +716,7 @@ async def register(user: UserCreate):
 
     token = create_access_token({"user_id": str(result.inserted_id), "role": user_dict["role"]})
 
-    response_user = to_json_serializable(user_dict)
+    response_user = to_json_serializable({k: v for k, v in user_dict.items() if k != "password"})
     response_user["id"] = str(result.inserted_id)
     response_user["estate_name"] = estate_name
 
@@ -1092,7 +1092,7 @@ async def validate_visitor_pass(code: str, pass_data: VisitorPassValidate, curre
     )
 
     await sio.emit("visitor_entry", {
-        "visitor_pass": to_json_serializable({**pass_data_db, "id": str(pass_data_db["_id"])}),
+        "visitor_pass": serialize_doc(pass_data_db),
         "guard": current_user["name"],
         "timestamp": now.isoformat()
     }, room=f"estate_{current_user['estate_id']}")
@@ -1495,7 +1495,7 @@ async def update_user(user_id: str, role: Optional[str] = None, is_active: Optio
     user = users_collection.find_one({"_id": ObjectId(user_id)})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    if current_user["role"] != "super_admin" and str(user.get("estate_id")) != current_user["estate_id"]:
+    if current_user["role"] != "super_admin" and str(user.get("estate_id")) != str(current_user["estate_id"]):
         raise HTTPException(status_code=403, detail="Access denied")
     update_data = {}
     if role:
@@ -1516,7 +1516,7 @@ async def update_user(user_id: str, role: Optional[str] = None, is_active: Optio
         "details": update_data,
         "timestamp": datetime.utcnow()
     })
-    return {"message": "User updated successfully", "user": to_json_serializable({**user, **update_data, "id": user_id})}
+    return {"message": "User updated successfully", "user": to_json_serializable({**{k: v for k, v in user.items() if k != "password"}, **update_data, "id": user_id})}
 
 
 @app.patch("/api/users/{user_id}/role")
@@ -1624,13 +1624,17 @@ async def single_invite(invite: UserInvite, current_user: Dict = Depends(require
 
     result = users_collection.insert_one(user_dict)
 
+    # Personalize the invite with the actual estate's name (the admin's estate)
+    inviting_estate = estates_collection.find_one({"_id": ObjectId(current_user["estate_id"])})
+    estate_name = (inviting_estate or {}).get("name") or "your estate"
+
     send_email(
         invite.email,
-        "You've been invited to NexHood",
+        f"You've been invited to {estate_name}",
         branded_email(
             "You've been invited",
             f"<p>Hi {invite.name},</p>"
-            f"<p>You've been added to NexHood as a <strong>{invite.role}</strong>.</p>"
+            f"<p>You've been added to <strong>{estate_name}</strong> on NexHood as a <strong>{invite.role}</strong>.</p>"
             f"<p>Login email: {invite.email}<br>Temporary password: <strong>{temp_password}</strong></p>"
             f"<p>Please log in and change your password from Settings once you're in.</p>"
         )
@@ -1673,6 +1677,9 @@ async def bulk_invite_users(file: UploadFile = File(...), current_user: Dict = D
         "estate_id": ObjectId(current_user["estate_id"]),
         "role": "admin"
     })
+    # Personalize invites with the estate's name — fetched once, not per row
+    inviting_estate = estates_collection.find_one({"_id": ObjectId(current_user["estate_id"])})
+    estate_name = (inviting_estate or {}).get("name") or "your estate"
     for row in reader:
         if not row or not row[0].strip():
             continue
@@ -1714,11 +1721,11 @@ async def bulk_invite_users(file: UploadFile = File(...), current_user: Dict = D
             })
             send_email(
                 email,
-                "You've been invited to NexHood",
+                f"You've been invited to {estate_name}",
                 branded_email(
                     "You've been invited",
                     f"<p>Hi {name},</p>"
-                    f"<p>You've been added to NexHood as a <strong>{role or 'resident'}</strong>.</p>"
+                    f"<p>You've been added to <strong>{estate_name}</strong> on NexHood as a <strong>{role or 'resident'}</strong>.</p>"
                     f"<p>Login email: {email}<br>Temporary password: <strong>{temp_password}</strong></p>"
                     f"<p>Please log in and change your password from Settings once you're in.</p>"
                 )
@@ -1943,7 +1950,7 @@ async def sync_offline(actions: List[SyncAction], current_user: Dict = Depends(g
             result = {"id": action.id}
             if action.type == "validate_visitor":
                 pass_data = passes_collection.find_one({"code": action.data["code"]})
-                if pass_data and str(pass_data["estate_id"]) == current_user["estate_id"]:
+                if pass_data and str(pass_data["estate_id"]) == str(current_user["estate_id"]):
                     passes_collection.update_one(
                         {"_id": pass_data["_id"]},
                         {"$set": {"status": "used", "used_at": action.timestamp, "used_by": ObjectId(current_user["_id"])}}
