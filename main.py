@@ -727,7 +727,7 @@ async def register(user: UserCreate):
         "action": "create",
         "entity": "user",
         "entity_id": str(result.inserted_id),
-        "details": user_dict,
+        "details": {k: v for k, v in user_dict.items() if k != "password"},
         "timestamp": datetime.utcnow()
     })
 
@@ -1002,6 +1002,19 @@ async def create_visitor_pass(pass_data: VisitorPassCreate, current_user: Dict =
         raise HTTPException(status_code=403, detail="Unauthorized")
     if not current_user.get("estate_id"):
         raise HTTPException(status_code=400, detail="User must be associated with an estate")
+    # Lazy janitor: strip stored QR images from this estate's passes that expired
+    # over 7 days ago. Pass records (names, times, gates) are kept forever for
+    # history/analytics — only the heavy QR image is removed. Keeps the free
+    # 512MB database self-cleaning without any cron job.
+    try:
+        passes_collection.update_many(
+            {"estate_id": ObjectId(current_user["estate_id"]),
+             "valid_until": {"$lt": datetime.utcnow() - timedelta(days=7)},
+             "qr_code": {"$exists": True}},
+            {"$unset": {"qr_code": ""}}
+        )
+    except Exception as cleanup_err:
+        logger.warning(f"QR cleanup skipped: {cleanup_err}")
     code = generate_visitor_code()
     # Only check against still-active passes — once a pass is used/expired
     # its code is fair game to reuse, so we don't burn through the (small,
@@ -1053,7 +1066,7 @@ async def create_visitor_pass(pass_data: VisitorPassCreate, current_user: Dict =
         "action": "create",
         "entity": "visitor_pass",
         "entity_id": str(result.inserted_id),
-        "details": pass_dict,
+        "details": {k: v for k, v in pass_dict.items() if k != "qr_code"},  # QR image excluded — was bloating the DB
         "timestamp": datetime.utcnow()
     })
     return {"message": "Visitor pass created successfully", "visitor_pass": serialize_doc(inserted_pass)}
@@ -1089,7 +1102,8 @@ async def validate_visitor_pass(code: str, pass_data: VisitorPassValidate, curre
 
     passes_collection.update_one(
         {"_id": pass_data_db["_id"]},
-        {"$set": {"status": "used", "used_at": now, "used_by": ObjectId(current_user["_id"]), "entry_gate": pass_data.entry_gate}}
+        {"$set": {"status": "used", "used_at": now, "used_by": ObjectId(current_user["_id"]), "entry_gate": pass_data.entry_gate},
+         "$unset": {"qr_code": ""}}  # the QR has served its purpose — free ~10KB per pass
     )
 
     await sio.emit("visitor_entry", {
@@ -1156,7 +1170,9 @@ async def create_incident(incident: IncidentCreate, current_user: Dict = Depends
         "action": "create",
         "entity": "incident",
         "entity_id": str(result.inserted_id),
-        "details": incident_dict,
+        # Photos excluded from the audit copy — they live once in the incident itself.
+        # Storing them twice was the single biggest use of database space.
+        "details": {**{k: v for k, v in incident_dict.items() if k != "images"}, "image_count": len(incident_dict.get("images") or [])},
         "timestamp": datetime.utcnow()
     })
     return {"message": "Incident reported successfully", "incident": serialize_doc(inserted_incident)}
@@ -1651,7 +1667,7 @@ async def single_invite(invite: UserInvite, current_user: Dict = Depends(require
         "action": "invite",
         "entity": "user",
         "entity_id": str(result.inserted_id),
-        "details": user_dict,
+        "details": {k: v for k, v in user_dict.items() if k != "password"},
         "timestamp": datetime.utcnow()
     })
 
@@ -1745,7 +1761,7 @@ async def bulk_invite_users(file: UploadFile = File(...), current_user: Dict = D
                 "action": "create",
                 "entity": "user",
                 "entity_id": str(result_id),
-                "details": user_dict,
+                "details": {k: v for k, v in user_dict.items() if k != "password"},
                 "timestamp": datetime.utcnow()
             })
         except Exception as e:
