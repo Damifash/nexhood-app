@@ -1,7 +1,7 @@
 # NEXHOOD BACKEND BUILD MARKER: v24-2026-08-15-security-fixes-idor-privesc
 # If /health below doesn't return this exact build string, the running
 # process is NOT this file — kill whatever's on port 8000 and restart.
-from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Request, UploadFile, File, Body
+from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Request, UploadFile, File, Body, BackgroundTasks
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, Field, ValidationError, field_validator
@@ -183,6 +183,26 @@ def send_email(to: Optional[str], subject: str, html: str) -> None:
         logger.error(f"Resend email failed for {to}: {e}")
 
 
+def notify_by_email(recipients, subject: str, html: str) -> None:
+    """Send the same notification to several people, one by one, never
+    raising. Designed to run as a FastAPI background task so the request
+    that triggered it (a panic alert, an incident) responds instantly
+    instead of waiting for every email round-trip. Recipients are
+    de-duplicated and capped at 95 to stay inside Resend's free tier
+    daily limit even in the worst case."""
+    seen = set()
+    clean = []
+    for r in recipients:
+        if r and r not in seen:
+            seen.add(r)
+            clean.append(r)
+    if len(clean) > 95:
+        logger.warning(f"notify_by_email: capping {len(clean)} recipients to 95 for '{subject}'")
+        clean = clean[:95]
+    for email_addr in clean:
+        send_email(email_addr, subject, html)
+
+
 def branded_email(title: str, body_html: str) -> str:
     """Wraps every outgoing email in one consistent NexHood-branded shell —
     invites, welcomes, alerts, police notifications, and password resets all
@@ -290,6 +310,12 @@ alert_rate_limit = defaultdict(list)
 # backed limiter would be the real fix if this ever needs to survive
 # restarts or run across multiple server instances.
 login_rate_limit = defaultdict(list)
+
+# Forgot-password and the public contact form both trigger outbound email,
+# so left unlimited they were a free lever for draining the Resend quota
+# or bombing someone's inbox with reset emails. Same in-memory pattern.
+reset_rate_limit = defaultdict(list)
+contact_rate_limit = defaultdict(list)
 
 
 # ---------------------------------------------------------------------------
@@ -662,10 +688,11 @@ async def health_check():
 
 @app.post("/api/auth/register")
 async def register(user: UserCreate):
-    """Public self-registration. Only residents can self-register; the first
-    resident to register under a given estate name becomes that estate's
-    admin. Guards/admins/police are created via the invite endpoints below,
-    not through this route."""
+    """Public self-registration = founding a NEW estate. The registrant
+    becomes that estate's admin. Estate names must be unique — if the name
+    is taken, the person is told to request an invite instead. Residents,
+    guards, and police only ever enter an estate via the admin invite
+    endpoints below."""
     if user.role != "resident":
         raise HTTPException(status_code=400, detail="Only residents can register publicly.")
 
@@ -677,18 +704,31 @@ async def register(user: UserCreate):
 
     estate_name = str(user.estate_id).strip()
 
-    # Auto-create the estate if it doesn't exist yet.
-    estate = estates_collection.find_one({"name": estate_name})
-    if not estate:
-        estate_doc = {
-            "name": estate_name,
-            "address": f"{estate_name}, Nigeria",
-            "created_at": datetime.utcnow()
-        }
-        estate_result = estates_collection.insert_one(estate_doc)
-        estate_id = estate_result.inserted_id
-    else:
-        estate_id = estate["_id"]
+    # SECURITY (Option A — invite-only joining):
+    # Public registration can only CREATE a brand-new estate, making the
+    # registrant its founding admin. It can never join an existing estate —
+    # previously, anyone who typed an existing estate's exact name was
+    # silently added to it as an active resident, letting strangers into
+    # estates (and their visitor passes, alerts, and community) uninvited.
+    # Joining an existing estate now happens exclusively through the
+    # admin invite endpoints. The name check is case-insensitive so
+    # "maraba estate" can't slip past "Maraba Estate".
+    existing = estates_collection.find_one(
+        {"name": {"$regex": f"^{re.escape(estate_name)}$", "$options": "i"}}
+    )
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="An estate with this name already exists. If you live there, ask your estate admin to send you an invite from the app."
+        )
+
+    estate_doc = {
+        "name": estate_name,
+        "address": f"{estate_name}, Nigeria",
+        "created_at": datetime.utcnow()
+    }
+    estate_result = estates_collection.insert_one(estate_doc)
+    estate_id = estate_result.inserted_id
 
     hashed_password = get_password_hash(user.password)
 
@@ -812,6 +852,14 @@ async def forgot_password(request: ForgotPasswordRequest):
     """Always returns the same generic message whether or not the email
     exists — that's intentional, so this endpoint can't be used to check
     which emails are registered."""
+    # 3 reset emails per hour per address — a real user rarely needs more,
+    # and it stops inbox-bombing / quota-draining abuse.
+    email_key = request.email.lower()
+    now = datetime.utcnow()
+    reset_rate_limit[email_key] = [t for t in reset_rate_limit[email_key] if (now - t).total_seconds() < 3600]
+    if len(reset_rate_limit[email_key]) >= 3:
+        return {"message": "If that email is registered, a reset link has been sent."}
+    reset_rate_limit[email_key].append(now)
     user = users_collection.find_one({"email": request.email})
     if user:
         token = secrets.token_urlsafe(32)
@@ -860,6 +908,14 @@ async def submit_contact(msg: ContactMessageCreate):
     is never lost even if the email send fails, then emails CONTACT_EMAIL
     with the details and sends the person a short confirmation so they know
     it actually went somewhere instead of vanishing into a form."""
+    # 3 messages per hour per email — stops spam scripts from burning the
+    # Resend quota through the public form.
+    email_key = msg.email.lower()
+    now = datetime.utcnow()
+    contact_rate_limit[email_key] = [t for t in contact_rate_limit[email_key] if (now - t).total_seconds() < 3600]
+    if len(contact_rate_limit[email_key]) >= 3:
+        raise HTTPException(status_code=429, detail="Too many messages. Please try again later.")
+    contact_rate_limit[email_key].append(now)
     doc = {
         "name": msg.name,
         "email": msg.email,
@@ -917,6 +973,31 @@ async def create_estate(estate: EstateCreate, current_user: Dict = Depends(requi
     except Exception as e:
         logger.error(f"Error creating estate: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to create estate: {str(e)}")
+
+
+@app.get("/api/estates/contacts")
+async def get_estate_contacts(current_user: Dict = Depends(get_current_user)):
+    """Tap-to-call directory for the caller's own estate: the configured
+    emergency contacts plus every active guard and admin (name + phone).
+    Available to ALL roles — a resident in trouble should be able to ring
+    the gate guard directly, not only 'call police'. The frontend renders
+    these as tel: links so one tap opens the phone dialer."""
+    estate = estates_collection.find_one({"_id": ObjectId(current_user["estate_id"])})
+    emergency_contacts = (estate or {}).get("settings", {}).get("emergencyContacts", [])
+    guards = list(users_collection.find(
+        {"estate_id": ObjectId(current_user["estate_id"]), "role": "guard", "is_active": True},
+        {"name": 1, "phone": 1}
+    ))
+    admins = list(users_collection.find(
+        {"estate_id": ObjectId(current_user["estate_id"]), "role": "admin", "is_active": True},
+        {"name": 1, "phone": 1}
+    ))
+    return {
+        "estate_name": (estate or {}).get("name"),
+        "emergency_contacts": emergency_contacts,
+        "guards": [{"id": str(g["_id"]), "name": g.get("name"), "phone": g.get("phone")} for g in guards],
+        "admins": [{"id": str(a["_id"]), "name": a.get("name"), "phone": a.get("phone")} for a in admins],
+    }
 
 
 @app.get("/api/estates/{estate_id}")
@@ -1133,7 +1214,7 @@ async def validate_visitor_pass(code: str, pass_data: VisitorPassValidate, curre
 
 
 @app.post("/api/incidents")
-async def create_incident(incident: IncidentCreate, current_user: Dict = Depends(get_current_user)):
+async def create_incident(incident: IncidentCreate, background_tasks: BackgroundTasks, current_user: Dict = Depends(get_current_user)):
     incident_dict = incident.dict(exclude_unset=True)
     incident_dict.update({
         "reporter_id": ObjectId(current_user["_id"]),
@@ -1152,18 +1233,19 @@ async def create_incident(incident: IncidentCreate, current_user: Dict = Depends
             "incident": serialize_doc(inserted_incident),
             "reporter": current_user["name"]
         }, room=f"estate_{current_user['estate_id']}")
-        admins = list(users_collection.find({"estate_id": ObjectId(current_user["estate_id"]), "role": {"$in": ["admin", "guard"]}}, {"email": 1}))
-        for admin in admins:
-            send_email(
-                admin.get("email"),
-                f"NexHood ALERT: {incident.severity.upper()} incident reported",
-                branded_email(
-                    f"{incident.severity.capitalize()} incident reported",
-                    f"<p><strong>{incident.title}</strong></p>"
-                    f"<p>{incident.description}</p>"
-                    f"<p>Reported by {current_user['name']}. Check the app for full details.</p>"
-                )
+        admins = list(users_collection.find({"estate_id": ObjectId(current_user["estate_id"]), "role": {"$in": ["admin", "guard"]}, "is_active": True}, {"email": 1}))
+        background_tasks.add_task(
+            notify_by_email,
+            [a.get("email") for a in admins if a.get("email")],
+            f"NexHood ALERT: {incident.severity.upper()} incident reported",
+            branded_email(
+                f"{incident.severity.capitalize()} incident reported",
+                f"<p><strong>{incident.title}</strong></p>"
+                f"<p>{incident.description}</p>"
+                f"<p>Reported by {current_user['name']}. Check the app for full details.</p>"
+                f"<p style='margin:20px 0;'><a href=\"{LOGIN_URL}\" style=\"background:#1e2a5e;color:#ffffff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:600;display:inline-block;\">Open NexHood</a></p>"
             )
+        )
     audit_logs_collection.insert_one({
         "user_id": ObjectId(current_user["_id"]),
         "estate_id": ObjectId(current_user["estate_id"]),
@@ -1258,7 +1340,7 @@ async def resolve_incident(incident_id: str, current_user: Dict = Depends(get_cu
 
 
 @app.post("/api/alerts")
-async def create_alert(alert: AlertCreate, current_user: Dict = Depends(get_current_user)):
+async def create_alert(alert: AlertCreate, background_tasks: BackgroundTasks, current_user: Dict = Depends(get_current_user)):
     try:
         user_id = str(current_user["_id"])
         current_time = datetime.utcnow()
@@ -1290,22 +1372,34 @@ async def create_alert(alert: AlertCreate, current_user: Dict = Depends(get_curr
             "sender": current_user.get("name", "Resident")
         }, room=f"estate_{current_user['estate_id']}")
 
-        if alert.priority in ["high", "critical"]:
+        if alert.priority in ["high", "critical"] or alert_dict["priority"] == "critical":
             estate = estates_collection.find_one({"_id": ObjectId(current_user["estate_id"])})
             emergency_contacts = (estate or {}).get("settings", {}).get("emergencyContacts", [])
-            for contact in emergency_contacts:
-                if contact.get("email"):
-                    send_email(
-                        contact["email"],
-                        f"NexHood EMERGENCY ALERT ({alert.priority.upper()}): {alert.type}",
-                        branded_email(
-                            f"{alert.priority.capitalize()} priority alert",
-                            f"<p>A {alert.priority} priority alert was raised at your estate.</p>"
-                            f"<p><strong>{alert.type.replace('_', ' ').title()}</strong></p>"
-                            f"<p>{alert.message or 'No details provided'}</p>"
-                            f"<p>Raised by {current_user.get('name', 'a resident')}.</p>"
-                        )
-                    )
+            # Notify BOTH the estate's configured emergency contacts AND every
+            # admin/guard of the estate. Sent as a background task so the
+            # panic request itself responds immediately — email round-trips
+            # must never sit between someone in danger and the "alert sent"
+            # confirmation.
+            staff = list(users_collection.find(
+                {"estate_id": ObjectId(current_user["estate_id"]), "role": {"$in": ["admin", "guard"]}, "is_active": True},
+                {"email": 1}
+            ))
+            recipients = [c.get("email") for c in emergency_contacts if c.get("email")] + \
+                         [s.get("email") for s in staff if s.get("email")]
+            background_tasks.add_task(
+                notify_by_email,
+                recipients,
+                f"NexHood EMERGENCY ALERT ({alert_dict['priority'].upper()}): {alert.type.replace('_', ' ').title()}",
+                branded_email(
+                    f"{alert_dict['priority'].capitalize()} priority alert",
+                    f"<p>A {alert_dict['priority']} priority alert was raised at <strong>{(estate or {}).get('name', 'your estate')}</strong>.</p>"
+                    f"<p><strong>{alert.type.replace('_', ' ').title()}</strong></p>"
+                    f"<p>{alert.message or 'No details provided'}</p>"
+                    f"<p>Raised by {current_user.get('name', 'a resident')}"
+                    f"{' — ' + current_user.get('phone') if current_user.get('phone') else ''}.</p>"
+                    f"<p style='margin:20px 0;'><a href=\"{LOGIN_URL}\" style=\"background:#1e2a5e;color:#ffffff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:600;display:inline-block;\">Open NexHood</a></p>"
+                )
+            )
 
         audit_logs_collection.insert_one({
             "user_id": ObjectId(current_user["_id"]),
@@ -2034,7 +2128,7 @@ async def get_visitor_passes(status: Optional[str] = None, start_date: Optional[
 
 
 @app.post("/api/community/posts")
-async def create_post(post: PostCreate, current_user: Dict = Depends(get_current_user)):
+async def create_post(post: PostCreate, background_tasks: BackgroundTasks, current_user: Dict = Depends(get_current_user)):
     post_dict = post.dict()
     post_dict.update({
         "author_id": ObjectId(current_user["_id"]),
@@ -2049,6 +2143,29 @@ async def create_post(post: PostCreate, current_user: Dict = Depends(get_current
     })
     result = posts_collection.insert_one(post_dict)
     await sio.emit("new_post", serialize_doc({**post_dict, "id": str(result.inserted_id)}), room=f"estate_{current_user['estate_id']}")
+    # Event posts are the one community post type worth an email — people
+    # shouldn't miss the estate BBQ because they didn't open the app.
+    # Everyone in the estate except the author gets one, in the background.
+    # General chatter and appreciation posts stay in-app only, both to keep
+    # emails meaningful and to protect the Resend free-tier quota.
+    if post.type == "event":
+        estate = estates_collection.find_one({"_id": ObjectId(current_user["estate_id"])})
+        members = list(users_collection.find(
+            {"estate_id": ObjectId(current_user["estate_id"]), "is_active": True, "_id": {"$ne": current_user["_id"]}},
+            {"email": 1}
+        ))
+        preview = post.content if len(post.content) <= 300 else post.content[:300] + "…"
+        background_tasks.add_task(
+            notify_by_email,
+            [m.get("email") for m in members if m.get("email")],
+            f"New event at {(estate or {}).get('name', 'your estate')}",
+            branded_email(
+                "New community event",
+                f"<p><strong>{current_user.get('name', 'A neighbour')}</strong> posted a new event:</p>"
+                f"<p style='white-space:pre-wrap;'>{preview}</p>"
+                f"<p style='margin:20px 0;'><a href=\"{LOGIN_URL}\" style=\"background:#1e2a5e;color:#ffffff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:600;display:inline-block;\">View in NexHood</a></p>"
+            )
+        )
     return {"post": serialize_doc({**post_dict, "id": str(result.inserted_id)})}
 
 
