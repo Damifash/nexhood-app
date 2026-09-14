@@ -1,4 +1,4 @@
-# NEXHOOD BACKEND BUILD MARKER: v24-2026-08-15-security-fixes-idor-privesc
+# NEXHOOD BACKEND BUILD MARKER: v25-2026-09-14-email-case-fix-pw-notify-moderation
 # If /health below doesn't return this exact build string, the running
 # process is NOT this file — kill whatever's on port 8000 and restart.
 from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Request, UploadFile, File, Body, BackgroundTasks
@@ -263,6 +263,23 @@ def normalize_phone(raw: str) -> str:
     if not re.fullmatch(r"\+[1-9]\d{6,14}", candidate):
         raise ValueError("Enter a valid phone number, e.g. 08012345678")
     return candidate
+
+
+def normalize_email(raw: str) -> str:
+    """Emails are case-insensitive by spec, but this app was storing and
+    matching them as-typed — meaning Fasoro@x.com and fasoro@x.com were
+    treated as two different accounts, and a user who registered with caps
+    could get "incorrect password" trying to log in with lowercase (or vice
+    versa). New/updated accounts are stored lowercase from here on."""
+    return (raw or "").strip().lower()
+
+
+def email_query(raw: str) -> dict:
+    """Case-insensitive, whitespace-safe exact-match query for looking up
+    an email that predates the normalize_email() fix above — some accounts
+    still have mixed-case emails stored from before this change, so lookups
+    stay case-insensitive even though new writes are lowercase."""
+    return {"email": {"$regex": f"^{re.escape((raw or '').strip())}$", "$options": "i"}}
 
 # Firebase placeholder
 # cred = credentials.Certificate("path/to/firebase.json")
@@ -673,7 +690,7 @@ async def location_update(sid, data):
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-BUILD_VERSION = "v24-2026-08-15-security-fixes-idor-privesc"
+BUILD_VERSION = "v25-2026-09-14-email-case-fix-pw-notify-moderation"
 
 
 @app.get("/health")
@@ -696,7 +713,7 @@ async def register(user: UserCreate):
     if user.role != "resident":
         raise HTTPException(status_code=400, detail="Only residents can register publicly.")
 
-    if users_collection.find_one({"email": user.email}):
+    if users_collection.find_one(email_query(user.email)):
         raise HTTPException(status_code=400, detail="User already exists")
 
     if not user.estate_id or not str(user.estate_id).strip():
@@ -734,6 +751,7 @@ async def register(user: UserCreate):
 
     user_dict = user.dict(exclude_unset=True)
     user_dict.update({
+        "email": normalize_email(user.email),
         "password": hashed_password,
         "estate_id": estate_id,
         "role": "resident",
@@ -809,7 +827,7 @@ async def login(request: LoginRequest):
     if len(login_rate_limit[email_key]) >= 10:
         raise HTTPException(status_code=429, detail="Too many login attempts. Please wait a few minutes and try again.")
 
-    user = users_collection.find_one({"email": request.email})
+    user = users_collection.find_one(email_query(request.email))
     if not user or not verify_password(request.password, user["password"]):
         login_rate_limit[email_key].append(now)
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -860,7 +878,7 @@ async def forgot_password(request: ForgotPasswordRequest):
     if len(reset_rate_limit[email_key]) >= 3:
         return {"message": "If that email is registered, a reset link has been sent."}
     reset_rate_limit[email_key].append(now)
-    user = users_collection.find_one({"email": request.email})
+    user = users_collection.find_one(email_query(request.email))
     if user:
         token = secrets.token_urlsafe(32)
         users_collection.update_one(
@@ -899,6 +917,21 @@ async def reset_password(request: ResetPasswordRequest):
         {"_id": user["_id"]},
         {"$set": {"password": hashed}, "$unset": {"reset_token": "", "reset_token_expires": ""}}
     )
+
+    send_email(
+        user["email"],
+        "Your NexHood password was changed",
+        branded_email(
+            "Password changed",
+            f"<p>Hi {user.get('name', '')},</p>"
+            f"<p>This is a confirmation that the password on your NexHood account "
+            f"({user['email']}) was just reset.</p>"
+            f"<p>If this was you, no action is needed.</p>"
+            f"<p style='color:#b91c1c;font-weight:600;'>If you didn't request this reset, "
+            f"contact your estate admin immediately — your account may be compromised.</p>"
+        )
+    )
+
     return {"message": "Password reset successfully. You can now log in with your new password."}
 
 
@@ -1288,14 +1321,29 @@ async def get_incident(incident_id: str, current_user: Dict = Depends(get_curren
 
 
 @app.patch("/api/incidents/{incident_id}")
-async def update_incident(incident_id: str, status: Optional[str] = None, assigned_to: Optional[str] = None, response: Optional[str] = None, current_user: Dict = Depends(get_current_user)):
+async def update_incident(incident_id: str, status: Optional[str] = None, assigned_to: Optional[str] = None, response: Optional[str] = None, title: Optional[str] = None, description: Optional[str] = None, current_user: Dict = Depends(get_current_user)):
     if current_user["role"] not in ["guard", "admin"]:
         raise HTTPException(status_code=403, detail="Unauthorized")
     incident = incidents_collection.find_one({"_id": ObjectId(incident_id)})
     if not incident or str(incident["estate_id"]) != str(current_user["estate_id"]):
         logger.error(f"Update failed for incident {incident_id}: incident={incident}, user_estate_id={current_user['estate_id']}")
         raise HTTPException(status_code=404, detail="Incident not found")
-    update_set = {}
+    # Editing the reported title/description is admin-only — it's a content
+    # moderation action (e.g. redacting a report that names someone's
+    # ethnicity/tribe as "suspicious" instead of describing actual conduct),
+    # not a routine status update guards should be able to do unsupervised.
+    if (title is not None or description is not None) and current_user["role"] not in ["admin", "super_admin"]:
+        raise HTTPException(status_code=403, detail="Only an admin can edit a reported incident's title or description")
+    edited_content = {}
+    if title is not None:
+        if len(title.strip()) < 3:
+            raise HTTPException(status_code=400, detail="Title must be at least 3 characters")
+        edited_content["title"] = title.strip()
+    if description is not None:
+        if len(description.strip()) < 10:
+            raise HTTPException(status_code=400, detail="Description must be at least 10 characters")
+        edited_content["description"] = description.strip()
+    update_set = dict(edited_content)
     if status:
         update_set["status"] = status
     if assigned_to:
@@ -1314,10 +1362,16 @@ async def update_incident(incident_id: str, status: Optional[str] = None, assign
     audit_logs_collection.insert_one({
         "user_id": ObjectId(current_user["_id"]),
         "estate_id": ObjectId(current_user["estate_id"]),
-        "action": "update",
+        "action": "edit_content" if edited_content else "update",
         "entity": "incident",
         "entity_id": incident_id,
-        "details": update_ops,
+        # When title/description were edited, keep the pre-edit values on
+        # record too — accountability for a moderation action, not just a
+        # routine status change.
+        "details": {
+            **update_ops,
+            **({"previous": {k: incident.get(k) for k in edited_content}} if edited_content else {})
+        },
         "timestamp": datetime.utcnow()
     })
     return {"message": "Incident updated successfully", "incident": serialize_doc(updated_incident)}
@@ -1335,7 +1389,13 @@ async def resolve_incident(incident_id: str, current_user: Dict = Depends(get_cu
     if not incident or str(incident.get("estate_id")) != str(current_user["estate_id"]):
         raise HTTPException(status_code=404, detail="Incident not found")
     incidents_collection.update_one({"_id": ObjectId(incident_id)}, {"$set": {"status": "resolved", "resolved_at": datetime.utcnow()}})
-    users_collection.update_one({"_id": ObjectId(current_user["_id"])}, {"$push": {"badges": BadgeAward(badge="Hero Resolver").dict()}})
+    # Award once, like Welcome Badge above — previously this pushed a new
+    # "Hero Resolver" badge on every single resolve with no dedup check, so
+    # an active guard/admin's profile ended up with dozens of copies of the
+    # same badge instead of it being a one-time milestone.
+    resolver = users_collection.find_one({"_id": ObjectId(current_user["_id"])}, {"badges": 1})
+    if not any(b["badge"] == "Hero Resolver" for b in (resolver or {}).get("badges", [])):
+        users_collection.update_one({"_id": ObjectId(current_user["_id"])}, {"$push": {"badges": BadgeAward(badge="Hero Resolver").dict()}})
     return {"message": "Incident resolved"}
 
 
@@ -1704,8 +1764,10 @@ async def single_invite(invite: UserInvite, current_user: Dict = Depends(require
     inviting residents, guards and police day-to-day; admin is a limited,
     high-trust role. Mirrors the same cap enforced in change_user_role().
     """
-    if users_collection.find_one({"email": invite.email}):
+    if users_collection.find_one(email_query(invite.email)):
         raise HTTPException(status_code=400, detail="User already exists")
+
+    invite_email = normalize_email(invite.email)
 
     if invite.role == "admin":
         current_admins = users_collection.count_documents({
@@ -1720,7 +1782,7 @@ async def single_invite(invite: UserInvite, current_user: Dict = Depends(require
 
     user_dict = {
         "name": invite.name,
-        "email": invite.email,
+        "email": invite_email,
         "phone": invite.phone,
         "password": hashed_password,
         "role": invite.role,
@@ -1740,13 +1802,13 @@ async def single_invite(invite: UserInvite, current_user: Dict = Depends(require
     estate_name = (inviting_estate or {}).get("name") or "your estate"
 
     send_email(
-        invite.email,
+        invite_email,
         f"You've been invited to {estate_name}",
         branded_email(
             "You've been invited",
             f"<p>Hi {invite.name},</p>"
             f"<p>You've been added to <strong>{estate_name}</strong> on NexHood as a <strong>{invite.role}</strong>.</p>"
-            f"<p>Login email: {invite.email}<br>Temporary password: <strong>{temp_password}</strong></p>"
+            f"<p>Login email: {invite_email}<br>Temporary password: <strong>{temp_password}</strong></p>"
             f"<p style=\"margin:24px 0;\"><a href=\"{LOGIN_URL}\" "
             f"style=\"background:#1e2a5e;color:#ffffff;text-decoration:none;padding:12px 28px;"
             f"border-radius:8px;font-weight:700;display:inline-block;\">Log in to NexHood</a></p>"
@@ -1767,7 +1829,7 @@ async def single_invite(invite: UserInvite, current_user: Dict = Depends(require
 
     return {
         "message": "User invited successfully",
-        "email": invite.email,
+        "email": invite_email,
         # Only hand the plaintext password back to the admin if email isn't
         # configured — otherwise it's already been sent directly to the
         # invitee and there's no reason for it to also sit in the admin's
@@ -1799,8 +1861,9 @@ async def bulk_invite_users(file: UploadFile = File(...), current_user: Dict = D
         if not row or not row[0].strip():
             continue
         name, email, phone, role, apartment = [field.strip() for field in row[:5]] + [None] * (5 - len(row))
+        email = normalize_email(email)
         try:
-            if users_collection.find_one({"email": email}):
+            if users_collection.find_one(email_query(email)):
                 results.append({"email": email, "status": "skipped", "reason": "User already exists"})
                 continue
             if (role or "resident") == "admin":
@@ -2394,9 +2457,13 @@ async def update_my_profile(update: ProfileUpdate, current_user: Dict = Depends(
     if not changes:
         raise HTTPException(status_code=400, detail="Nothing to update")
 
-    if "email" in changes and changes["email"].lower() != current_user["email"].lower():
-        if users_collection.find_one({"email": changes["email"], "_id": {"$ne": ObjectId(current_user["_id"])}}):
-            raise HTTPException(status_code=400, detail="That email is already in use")
+    if "email" in changes:
+        changes["email"] = normalize_email(changes["email"])
+        if changes["email"] != current_user["email"].lower():
+            dup_query = email_query(changes["email"])
+            dup_query["_id"] = {"$ne": ObjectId(current_user["_id"])}
+            if users_collection.find_one(dup_query):
+                raise HTTPException(status_code=400, detail="That email is already in use")
 
     users_collection.update_one({"_id": ObjectId(current_user["_id"])}, {"$set": changes})
 
@@ -2435,6 +2502,24 @@ async def change_password(data: dict, current_user: Dict = Depends(get_current_u
     users_collection.update_one(
         {"_id": current_user["_id"]},
         {"$set": {"password": hashed_new}}
+    )
+
+    # Security notification — lets the real owner know immediately if
+    # someone else (or they themselves) just changed the password, so a
+    # compromised account doesn't go unnoticed silently.
+    send_email(
+        current_user["email"],
+        "Your NexHood password was changed",
+        branded_email(
+            "Password changed",
+            f"<p>Hi {current_user.get('name', '')},</p>"
+            f"<p>This is a confirmation that the password on your NexHood account "
+            f"({current_user['email']}) was just changed.</p>"
+            f"<p>If this was you, no action is needed.</p>"
+            f"<p style='color:#b91c1c;font-weight:600;'>If you didn't make this change, "
+            f"contact your estate admin or reply to this email immediately — your account "
+            f"may be compromised.</p>"
+        )
     )
 
     return {"message": "Password changed successfully"}
