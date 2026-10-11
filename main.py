@@ -1,4 +1,4 @@
-# NEXHOOD BACKEND BUILD MARKER: v25-2026-09-14-email-case-fix-pw-notify-moderation
+# NEXHOOD BACKEND BUILD MARKER: v26-2026-10-11-waitlist
 # If /health below doesn't return this exact build string, the running
 # process is NOT this file — kill whatever's on port 8000 and restart.
 from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Request, UploadFile, File, Body, BackgroundTasks
@@ -11,6 +11,7 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 import os
 import re
+import html  # escaping user text in outgoing emails
 import qrcode
 import pyotp
 from datetime import datetime, timedelta
@@ -299,6 +300,7 @@ try:
     donations_collection = db["donations"]
     campaigns_collection = db["welfare_campaigns"]
     contact_messages_collection = db["contact_messages"]
+    waitlist_collection = db["waitlist"]
     login_logs_collection = db["login_logs"]
     client.server_info()
     logger.info("Connected to MongoDB")
@@ -309,6 +311,15 @@ except Exception as e:
 # Geo index for locations
 incidents_collection.create_index([("location", "2dsphere")])
 alerts_collection.create_index([("location", "2dsphere")])
+# Waitlist lookups: duplicate check by phone, referral lookup by code, and
+# "how many people from this estate" counts. Wrapped so a index hiccup can
+# never stop the API from booting for existing users.
+try:
+    waitlist_collection.create_index("phone")
+    waitlist_collection.create_index("ref_code")
+    waitlist_collection.create_index("estate_key")
+except Exception as e:
+    logger.error(f"Waitlist index creation failed (non-fatal): {e}")
 
 # Password Hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -333,6 +344,7 @@ login_rate_limit = defaultdict(list)
 # or bombing someone's inbox with reset emails. Same in-memory pattern.
 reset_rate_limit = defaultdict(list)
 contact_rate_limit = defaultdict(list)
+waitlist_rate_limit = defaultdict(list)
 
 
 # ---------------------------------------------------------------------------
@@ -534,6 +546,56 @@ class ContactMessageCreate(BaseModel):
     message: str = Field(..., min_length=10, max_length=3000)
 
 
+WAITLIST_ROLES = ("resident", "estate_admin", "security", "other")
+WAITLIST_SIZES = ("under_50", "50_200", "200_plus")
+
+
+class WaitlistCreate(BaseModel):
+    """Public landing-page waitlist. No auth — the people signing up don't
+    have accounts yet. `website` is a honeypot (real users never see it) and
+    `elapsed_ms` is how long the form was open; both are cheap bot filters."""
+    name: str = Field(..., min_length=2, max_length=80)
+    phone: str = Field(...)
+    email: Optional[EmailStr] = None
+    role: str = Field(...)
+    estate_name: str = Field(..., min_length=2, max_length=100)
+    area: str = Field(..., min_length=2, max_length=60)
+    estate_size: Optional[str] = None
+    source: Optional[str] = Field(None, max_length=300)
+    ref: Optional[str] = Field(None, max_length=20)
+    website: Optional[str] = None
+    elapsed_ms: Optional[int] = None
+
+    @field_validator("phone")
+    @classmethod
+    def _normalize_phone(cls, v):
+        return normalize_phone(v)
+
+    @field_validator("role")
+    @classmethod
+    def _check_role(cls, v):
+        if v not in WAITLIST_ROLES:
+            raise ValueError("Pick a role")
+        return v
+
+    @field_validator("estate_size")
+    @classmethod
+    def _check_size(cls, v):
+        if v in (None, ""):
+            return None
+        if v not in WAITLIST_SIZES:
+            raise ValueError("Pick an estate size")
+        return v
+
+    @field_validator("name", "estate_name", "area")
+    @classmethod
+    def _strip(cls, v):
+        v = re.sub(r"\s+", " ", (v or "")).strip()
+        if len(v) < 2:
+            raise ValueError("This field is required")
+        return v
+
+
 class SyncAction(BaseModel):
     id: str
     type: str = Field(..., pattern="^(validate_visitor|create_incident|create_alert)$")
@@ -690,7 +752,7 @@ async def location_update(sid, data):
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-BUILD_VERSION = "v25-2026-09-14-email-case-fix-pw-notify-moderation"
+BUILD_VERSION = "v26-2026-10-11-waitlist"
 
 
 @app.get("/health")
@@ -980,6 +1042,118 @@ async def submit_contact(msg: ContactMessageCreate):
     )
 
     return {"message": "Thanks — we've received your message and will get back to you soon.", "id": str(result.inserted_id)}
+
+
+def _waitlist_estate_key(name: str) -> str:
+    """'Maraba  Estate', 'maraba estate' and 'Maraba Estate ' all count as
+    the same estate for the "N people from your estate" number."""
+    return re.sub(r"\s+", " ", (name or "").strip().lower())
+
+
+def _new_waitlist_ref_code() -> str:
+    for _ in range(10):
+        code = "".join(secrets.choice(VISITOR_CODE_ALPHABET) for _ in range(6))
+        if not waitlist_collection.find_one({"ref_code": code}, {"_id": 1}):
+            return code
+    return secrets.token_hex(4).upper()
+
+
+WAITLIST_ROLE_LABELS = {
+    "resident": "Resident",
+    "estate_admin": "Estate admin / Exco / Facility manager",
+    "security": "Security company / Guard",
+    "other": "Other",
+}
+
+
+@app.post("/api/waitlist")
+async def join_waitlist(entry: WaitlistCreate, request: Request, background_tasks: BackgroundTasks):
+    """Landing-page waitlist. Completely separate from users/estates — it
+    only writes to the `waitlist` collection, so nothing here can affect
+    existing accounts. Duplicate phone numbers return the existing entry
+    (so the person still gets their share link) instead of an error."""
+    # Honeypot / too-fast submit: pretend it worked, store nothing.
+    if (entry.website or "").strip() or (entry.elapsed_ms is not None and entry.elapsed_ms < 2000):
+        logger.info("Waitlist submission dropped by bot filter")
+        return {"ok": True, "ref_code": "", "estate_count": 0, "already_joined": False}
+
+    now = datetime.utcnow()
+    forwarded = request.headers.get("x-forwarded-for", "")
+    client_ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
+    for key, limit in ((f"ip:{client_ip}", 10), (f"phone:{entry.phone}", 5)):
+        waitlist_rate_limit[key] = [t for t in waitlist_rate_limit[key] if (now - t).total_seconds() < 3600]
+        if len(waitlist_rate_limit[key]) >= limit:
+            raise HTTPException(status_code=429, detail="Too many attempts. Please try again in a little while.")
+        waitlist_rate_limit[key].append(now)
+
+    estate_key = _waitlist_estate_key(entry.estate_name)
+    email = entry.email.lower() if entry.email else None
+
+    existing = waitlist_collection.find_one({"phone": entry.phone})
+    if not existing and email:
+        existing = waitlist_collection.find_one({"email": email})
+    if existing:
+        count = waitlist_collection.count_documents({"estate_key": existing.get("estate_key", estate_key)})
+        return {"ok": True, "ref_code": existing.get("ref_code", ""), "estate_count": count, "already_joined": True}
+
+    referred_by = None
+    if entry.ref:
+        ref_code = entry.ref.strip().upper()
+        if waitlist_collection.find_one_and_update({"ref_code": ref_code}, {"$inc": {"referrals": 1}}):
+            referred_by = ref_code
+
+    doc = {
+        "name": entry.name,
+        "phone": entry.phone,
+        "email": email,
+        "role": entry.role,
+        "estate_name": entry.estate_name,
+        "estate_key": estate_key,
+        "area": entry.area,
+        "estate_size": entry.estate_size if entry.role == "estate_admin" else None,
+        "source": entry.source,
+        "referred_by": referred_by,
+        "referrals": 0,
+        "ref_code": _new_waitlist_ref_code(),
+        "status": "new",
+        "created_at": now,
+    }
+    waitlist_collection.insert_one(doc)
+    count = waitlist_collection.count_documents({"estate_key": estate_key})
+
+    esc = html.escape
+    background_tasks.add_task(
+        send_email,
+        CONTACT_EMAIL,
+        f"Waitlist: {entry.name} ({entry.estate_name}, {entry.area}) — {count} from this estate",
+        branded_email(
+            "New waitlist signup",
+            f"<p><strong>{esc(entry.name)}</strong> — {esc(WAITLIST_ROLE_LABELS.get(entry.role, entry.role))}</p>"
+            f"<p>Estate: {esc(entry.estate_name)} · {esc(entry.area)}"
+            + (f" · size {esc(entry.estate_size)}" if doc["estate_size"] else "")
+            + "</p>"
+            f"<p>Phone: {esc(entry.phone)}<br/>Email: {esc(email or '—')}</p>"
+            f"<p><strong>{count}</strong> signup(s) from this estate so far."
+            + (f" Referred by {esc(referred_by)}." if referred_by else "")
+            + "</p>"
+        ),
+    )
+    if email:
+        share_link = f"{FRONTEND_URL}/?ref={doc['ref_code']}#waitlist"
+        background_tasks.add_task(
+            send_email,
+            email,
+            "You're on the NexHood waitlist",
+            branded_email(
+                "You're on the list",
+                f"<p>Hi {esc(entry.name.split(' ')[0])},</p>"
+                f"<p>Thanks for joining the NexHood waitlist for <strong>{esc(entry.estate_name)}</strong>. "
+                "We bring NexHood to estates where neighbours are asking for it, so the more people from your estate who join, the sooner we reach you.</p>"
+                f"<p>Share your link with your estate WhatsApp group:<br/><a href='{share_link}'>{share_link}</a></p>"
+            ),
+        )
+
+    return {"ok": True, "ref_code": doc["ref_code"], "estate_count": count, "already_joined": False}
 
 
 @app.post("/api/estates")
