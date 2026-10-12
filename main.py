@@ -1,4 +1,4 @@
-# NEXHOOD BACKEND BUILD MARKER: v28-2026-10-12-analytics
+# NEXHOOD BACKEND BUILD MARKER: v29-2026-10-12-activity-dates
 # If /health below doesn't return this exact build string, the running
 # process is NOT this file — kill whatever's on port 8000 and restart.
 from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Request, UploadFile, File, Body, BackgroundTasks
@@ -44,6 +44,17 @@ class MongoJSONEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
+def to_utc_iso(value: datetime) -> str:
+    """All datetimes in this app are stored as naive UTC. Sending them
+    without a timezone made browsers treat them as local time (every time
+    in the app showed 1 hour early in Nigeria), and the 6-digit
+    microseconds made some browsers (Safari) show "Invalid Date". Always
+    send e.g. 2026-10-12T15:56:09.633Z instead."""
+    if value.tzinfo is not None:
+        value = (value - value.utcoffset()).replace(tzinfo=None)
+    return value.isoformat(timespec="milliseconds") + "Z"
+
+
 def serialize_doc(doc) -> dict:
     """Recursively convert a MongoDB document to be JSON-safe.
 
@@ -66,7 +77,7 @@ def serialize_doc(doc) -> dict:
         elif isinstance(value, ObjectId):
             result[key] = str(value)
         elif isinstance(value, datetime):
-            result[key] = value.isoformat()
+            result[key] = to_utc_iso(value)
         elif isinstance(value, list):
             result[key] = [serialize_doc(v) if isinstance(v, (dict, list)) else str(v) if isinstance(v, ObjectId) else v for v in value]
         elif isinstance(value, dict):
@@ -260,6 +271,10 @@ def normalize_phone(raw: str) -> str:
     digits = re.sub(r"[^\d+]", "", raw or "")
     if not digits:
         raise ValueError("Phone number is required")
+    # People often keep the leading 0 after the country code
+    # (+2340803..., 2340803...). That 0 must go, or the number is invalid.
+    if re.fullmatch(r"\+?2340\d{10}", digits):
+        digits = "+234" + digits[-10:]
     if digits.startswith("+"):
         candidate = digits
     elif digits.startswith("234") and len(digits) >= 12:
@@ -664,7 +679,7 @@ async def generate_qr_code(data: Dict) -> str:
 
 
 def to_json_serializable(data: Dict) -> Dict:
-    return {k: str(v) if isinstance(v, ObjectId) else v for k, v in data.items()}
+    return {k: str(v) if isinstance(v, ObjectId) else to_utc_iso(v) if isinstance(v, datetime) else v for k, v in data.items()}
 
 
 # Authentication
@@ -781,7 +796,7 @@ async def location_update(sid, data):
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-BUILD_VERSION = "v28-2026-10-12-analytics"
+BUILD_VERSION = "v29-2026-10-12-activity-dates"
 
 
 @app.get("/health")
@@ -2011,6 +2026,7 @@ async def delete_user(user_id: str, current_user: Dict = Depends(require_admin))
         "action": "delete",
         "entity": "user",
         "entity_id": user_id,
+        "details": {"name": target.get("name"), "role": target.get("role")},
         "timestamp": datetime.utcnow()
     })
 
@@ -2218,6 +2234,151 @@ def _pct_change(cur, prev):
     return round((cur - prev) / prev * 100)
 
 
+def _first_name(name: Optional[str]) -> str:
+    return (name or "Someone").strip() or "Someone"
+
+
+ALERT_TYPE_LABEL = {
+    "panic": "panic", "emergency": "emergency", "security_breach": "security breach",
+    "fire": "fire", "medical": "medical", "general": "general",
+}
+
+
+def build_estate_feed(estate_filter: Dict, since: datetime, limit: int = 30) -> List[Dict]:
+    """What actually happened in the estate, in plain words, newest first:
+    visitors, incidents, alerts, community posts and people joining. Built
+    from the real records (not the audit log) so every line can name who
+    and what. Admin housekeeping lives in build_admin_log instead."""
+    items: List[Dict] = []
+    name_cache: Dict = {}
+
+    def user_name(uid):
+        if not uid:
+            return "Someone"
+        if uid not in name_cache:
+            u = users_collection.find_one({"_id": uid}, {"name": 1})
+            name_cache[uid] = (u or {}).get("name") or "A former resident"
+        return name_cache[uid]
+
+    for p in passes_collection.find({**estate_filter, "$or": [{"created_at": {"$gte": since}}, {"used_at": {"$gte": since}}]},
+                                    {"visitor_name": 1, "host_name": 1, "host_id": 1, "created_at": 1, "used_at": 1, "status": 1}).limit(200):
+        visitor = p.get("visitor_name") or "a visitor"
+        host = p.get("host_name") or user_name(p.get("host_id"))
+        if p.get("created_at") and p["created_at"] >= since:
+            items.append({"kind": "pass_created", "at": p["created_at"], "link": "/app/visitor-passes",
+                          "actor": host, "text": f"created a visitor pass for {visitor}"})
+        if p.get("used_at") and p["used_at"] >= since:
+            items.append({"kind": "pass_used", "at": p["used_at"], "link": "/app/visitor-passes",
+                          "actor": visitor, "text": f"arrived at the gate (visiting {host})"})
+
+    for i in incidents_collection.find({**estate_filter, "$or": [{"created_at": {"$gte": since}}, {"resolved_at": {"$gte": since}}]},
+                                       {"title": 1, "severity": 1, "reporter_id": 1, "reporter_name": 1, "created_at": 1, "resolved_at": 1}).limit(200):
+        title = i.get("title") or "an incident"
+        link = f"/app/incidents/{i['_id']}"
+        if i.get("created_at") and i["created_at"] >= since:
+            items.append({"kind": "incident", "at": i["created_at"], "link": link, "level": i.get("severity"),
+                          "actor": i.get("reporter_name") or user_name(i.get("reporter_id")),
+                          "text": f"reported \u201c{title}\u201d ({i.get('severity', 'medium')})"})
+        if i.get("resolved_at") and i["resolved_at"] >= since:
+            items.append({"kind": "incident_resolved", "at": i["resolved_at"], "link": link,
+                          "actor": "", "text": f"Incident \u201c{title}\u201d was resolved"})
+
+    for a in alerts_collection.find({**estate_filter, "$or": [{"created_at": {"$gte": since}}, {"resolved_at": {"$gte": since}}]},
+                                    {"type": 1, "sender_id": 1, "sender_name": 1, "created_at": 1, "resolved_at": 1, "resolved_by": 1,
+                                     "acknowledged_by": 1, "police_notified_at": 1}).limit(200):
+        label = ALERT_TYPE_LABEL.get(a.get("type"), "an")
+        if a.get("created_at") and a["created_at"] >= since:
+            items.append({"kind": "alert", "at": a["created_at"], "link": "/app/alerts", "level": "critical",
+                          "actor": a.get("sender_name") or user_name(a.get("sender_id")),
+                          "text": f"raised a {label} alert"})
+        for ack in (a.get("acknowledged_by") or []):
+            if ack.get("timestamp") and ack["timestamp"] >= since:
+                items.append({"kind": "alert_ack", "at": ack["timestamp"], "link": "/app/alerts",
+                              "actor": user_name(ack.get("user_id")), "text": f"responded to the {label} alert"})
+        if a.get("police_notified_at") and a["police_notified_at"] >= since:
+            items.append({"kind": "police", "at": a["police_notified_at"], "link": "/app/alerts",
+                          "actor": "", "text": f"Police were notified about the {label} alert"})
+        if a.get("resolved_at") and a["resolved_at"] >= since:
+            items.append({"kind": "alert_resolved", "at": a["resolved_at"], "link": "/app/alerts",
+                          "actor": user_name(a.get("resolved_by")) if a.get("resolved_by") else "",
+                          "text": f"resolved the {label} alert" if a.get("resolved_by") else f"The {label} alert was resolved"})
+
+    for po in posts_collection.find({**estate_filter, "created_at": {"$gte": since}}, {"author_name": 1, "type": 1, "content": 1, "created_at": 1}).limit(100):
+        preview = (po.get("content") or "").strip().replace("\n", " ")
+        preview = preview[:60] + ("\u2026" if len(preview) > 60 else "")
+        what = {"event": "posted an event", "appreciation": "shared an appreciation post"}.get(po.get("type"), "posted in Community")
+        items.append({"kind": "post", "at": po["created_at"], "link": "/app/community",
+                      "actor": po.get("author_name") or "Someone", "text": f"{what}: \u201c{preview}\u201d"})
+
+    for u in users_collection.find({**estate_filter, "created_at": {"$gte": since}}, {"name": 1, "role": 1, "created_at": 1}).limit(100):
+        items.append({"kind": "joined", "at": u["created_at"], "link": "/app/users",
+                      "actor": u.get("name") or "Someone", "text": f"joined as {u.get('role', 'resident')}"})
+
+    items.sort(key=lambda x: x["at"], reverse=True)
+    return items[:limit]
+
+
+def build_admin_log(estate_filter: Dict, since: datetime, limit: int = 40) -> List[Dict]:
+    """Admin actions (invites, removals, role and settings changes), with the
+    person or thing they affected spelled out."""
+    logs = list(audit_logs_collection.find(
+        {**estate_filter, "timestamp": {"$gte": since},
+         "action": {"$in": ["invite", "delete", "role_change", "update", "update_settings", "verify", "edit_content"]},
+         "entity": {"$in": ["user", "estate", "donation", "incident"]}},
+        {"user_id": 1, "action": 1, "entity": 1, "entity_id": 1, "details": 1, "timestamp": 1}
+    ).sort("timestamp", -1).limit(limit))
+    ids = set()
+    for l in logs:
+        if l.get("user_id"):
+            ids.add(l["user_id"])
+        if l.get("entity") == "user" and l.get("entity_id") and ObjectId.is_valid(str(l["entity_id"])):
+            ids.add(ObjectId(str(l["entity_id"])))
+    people = {u["_id"]: u for u in users_collection.find({"_id": {"$in": list(ids)}}, {"name": 1, "role": 1})}
+
+    out = []
+    for l in logs:
+        d = l.get("details") or {}
+        actor = (people.get(l.get("user_id")) or {}).get("name") or "An admin"
+        target_doc = people.get(ObjectId(str(l["entity_id"]))) if l.get("entity") == "user" and l.get("entity_id") and ObjectId.is_valid(str(l["entity_id"])) else None
+        target = d.get("name") or (target_doc or {}).get("name")
+        act, ent = l.get("action"), l.get("entity")
+        if ent == "user" and act == "invite":
+            text = f"invited {target or 'a new user'} as {d.get('role', 'resident')}"
+        elif ent == "user" and act == "delete":
+            text = f"removed {target} ({d.get('role')})" if target and d.get("role") else f"removed {target}" if target else "removed a user account"
+        elif ent == "user" and act == "role_change":
+            text = f"changed {target or 'a user'}'s role to {d.get('new_role', 'another role')}"
+        elif ent == "user" and act == "update":
+            if d.get("is_active") is False:
+                text = f"deactivated {target or 'a user'}"
+            elif d.get("is_active") is True:
+                text = f"reactivated {target or 'a user'}"
+            elif d.get("role"):
+                text = f"changed {target or 'a user'}'s role to {d['role']}"
+            else:
+                text = f"updated {target or 'a user'}'s details"
+        elif ent == "estate" and act == "update_settings":
+            keys = [k.replace("settings.", "") for k in d.keys()]
+            what = []
+            if any(k.startswith("police") for k in keys):
+                what.append("police contact")
+            if "emergencyContacts" in keys:
+                what.append("emergency contacts")
+            if any(k in keys for k in ("allowGuests", "requireApproval", "maxVisitorDuration")):
+                what.append("visitor rules")
+            text = f"updated the estate's {' and '.join(what) or 'settings'}"
+        elif ent == "donation" and act == "verify":
+            amt = d.get("amount")
+            text = f"confirmed a \u20a6{amt:,.0f} welfare pledge" if isinstance(amt, (int, float)) else "confirmed a welfare pledge"
+        elif ent == "incident" and act == "edit_content":
+            text = "edited an incident report"
+        else:
+            continue
+        out.append({"kind": f"{ent}_{act}", "at": l["timestamp"], "actor": actor, "text": text})
+    return out
+
+
+
 def build_admin_analytics(estate_filter: Dict, days: int, estate: Optional[Dict]) -> Dict:
     """Everything the admin Dashboard and Analytics pages show, for the last
     `days` days, compared with the `days` before that. Estates are small
@@ -2311,6 +2472,11 @@ def build_admin_analytics(estate_filter: Dict, days: int, estate: Optional[Dict]
     residents = [u for u in users if u.get("role") == "resident"]
     residents_dormant = sum(1 for u in residents if not u.get("last_seen") or u["last_seen"] < now - timedelta(days=30))
     residents_no_unit = sum(1 for u in residents if not (u.get("apartment") or "").strip())
+    residents_active_7d = sum(1 for u in residents if u.get("last_seen") and u["last_seen"] >= now - timedelta(days=7))
+    members = sorted(
+        [{"name": u.get("name"), "role": u.get("role"), "unit": u.get("apartment"), "last_seen": u.get("last_seen")} for u in users],
+        key=lambda m: m["last_seen"] or datetime.min, reverse=True,
+    )
     logins_period = login_logs_collection.count_documents({**estate_filter, "timestamp": {"$gte": start}})
 
     # --- open items (not limited to the period: these need action now) ---
@@ -2421,17 +2587,9 @@ def build_admin_analytics(estate_filter: Dict, days: int, estate: Optional[Dict]
             {"key": "first_pass", "label": "First visitor pass scanned at the gate", "done": passes_collection.count_documents({**estate_filter, "status": "used"}) > 0},
         ]
 
-    # --- recent activity with names ---
-    logs = list(audit_logs_collection.find({**estate_filter, "timestamp": {"$gte": start}}, {"user_id": 1, "action": 1, "entity": 1, "timestamp": 1}).sort("timestamp", -1).limit(25))
-    actor_ids = list({l.get("user_id") for l in logs if l.get("user_id")})
-    actors = {u["_id"]: u for u in users_collection.find({"_id": {"$in": actor_ids}}, {"name": 1, "role": 1})}
-    recent_activity = [{
-        "actor": (actors.get(l.get("user_id")) or {}).get("name") or "Someone",
-        "role": (actors.get(l.get("user_id")) or {}).get("role"),
-        "action": l.get("action"),
-        "entity": l.get("entity"),
-        "at": l.get("timestamp"),
-    } for l in logs]
+    # --- activity ---
+    recent_activity = build_estate_feed(estate_filter, start)
+    admin_log = build_admin_log(estate_filter, start)
 
     welfare_raised_agg = list(donations_collection.aggregate([
         {"$match": {**estate_filter, "status": "verified"}},
@@ -2475,6 +2633,8 @@ def build_admin_analytics(estate_filter: Dict, days: int, estate: Optional[Dict]
             "residents": len(residents),
             "residents_dormant_30d": residents_dormant,
             "residents_no_unit": residents_no_unit,
+            "residents_active_7d": residents_active_7d,
+            "members": members,
         },
         "visitors": {"by_hour": by_hour, "by_weekday": by_weekday, "status": pass_status},
         "trends": {
@@ -2501,6 +2661,7 @@ def build_admin_analytics(estate_filter: Dict, days: int, estate: Optional[Dict]
         "attention": attention,
         "setup": setup,
         "recent_activity": recent_activity,
+        "admin_log": admin_log,
     }
 
 
