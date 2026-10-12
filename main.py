@@ -1,4 +1,4 @@
-# NEXHOOD BACKEND BUILD MARKER: v29-2026-10-12-activity-dates
+# NEXHOOD BACKEND BUILD MARKER: v30-2026-10-13-bills-finances-repairs
 # If /health below doesn't return this exact build string, the running
 # process is NOT this file — kill whatever's on port 8000 and restart.
 from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Request, UploadFile, File, Body, BackgroundTasks
@@ -796,7 +796,7 @@ async def location_update(sid, data):
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-BUILD_VERSION = "v29-2026-10-12-activity-dates"
+BUILD_VERSION = "v30-2026-10-13-bills-finances-repairs"
 
 
 @app.get("/health")
@@ -2323,8 +2323,9 @@ def build_admin_log(estate_filter: Dict, since: datetime, limit: int = 40) -> Li
     person or thing they affected spelled out."""
     logs = list(audit_logs_collection.find(
         {**estate_filter, "timestamp": {"$gte": since},
-         "action": {"$in": ["invite", "delete", "role_change", "update", "update_settings", "verify", "edit_content"]},
-         "entity": {"$in": ["user", "estate", "donation", "incident"]}},
+         "action": {"$in": ["invite", "delete", "role_change", "update", "update_settings", "verify", "edit_content",
+                            "issue_bills", "confirm_payment", "create", "approve", "void", "update_finance_settings"]},
+         "entity": {"$in": ["user", "estate", "donation", "incident", "charge", "payment", "expense"]}},
         {"user_id": 1, "action": 1, "entity": 1, "entity_id": 1, "details": 1, "timestamp": 1}
     ).sort("timestamp", -1).limit(limit))
     ids = set()
@@ -2372,6 +2373,18 @@ def build_admin_log(estate_filter: Dict, since: datetime, limit: int = 40) -> Li
             text = f"confirmed a \u20a6{amt:,.0f} welfare pledge" if isinstance(amt, (int, float)) else "confirmed a welfare pledge"
         elif ent == "incident" and act == "edit_content":
             text = "edited an incident report"
+        elif ent == "charge" and act == "issue_bills":
+            text = f"issued {d.get('count', 0)} \u201c{d.get('name', 'estate')}\u201d bills for {d.get('period', '')}"
+        elif ent == "payment" and act == "confirm_payment":
+            text = f"confirmed a {_naira(d.get('amount'))} payment from {d.get('unit') or 'a unit'}"
+        elif ent == "expense" and act == "create":
+            text = f"recorded a {_naira(d.get('amount'))} expense ({CATEGORY_LABEL.get(d.get('category'), d.get('category'))})" + (" \u2014 waiting for approval" if d.get("status") == "pending_approval" else "")
+        elif ent == "expense" and act == "approve":
+            text = f"approved a {_naira(d.get('amount'))} expense"
+        elif ent == "expense" and act == "void":
+            text = f"voided a {_naira(d.get('amount'))} expense: {d.get('reason', '')}"
+        elif ent == "estate" and act == "update_finance_settings":
+            text = "updated the estate's bank details / approval rules"
         else:
             continue
         out.append({"kind": f"{ent}_{act}", "at": l["timestamp"], "actor": actor, "text": text})
@@ -2563,6 +2576,31 @@ def build_admin_analytics(estate_filter: Dict, days: int, estate: Optional[Dict]
             "detail": "Confirm the ones you've received so the campaign totals are right.",
             "link": "/app/welfare",
         })
+    if estate is not None:
+        pend_pay = payments_collection.count_documents({**estate_filter, "status": "pending"})
+        if pend_pay:
+            attention.append({
+                "key": "pending_payments", "level": "warning",
+                "title": f"{pend_pay} payment{'s' if pend_pay != 1 else ''} waiting for you to confirm",
+                "detail": "Residents say they've paid. Check your bank, then confirm so their bills are cleared.",
+                "link": "/app/payments",
+            })
+        pend_exp = expenses_collection.count_documents({**estate_filter, "status": "pending_approval"})
+        if pend_exp:
+            attention.append({
+                "key": "pending_expenses", "level": "warning",
+                "title": f"{pend_exp} expense{'s' if pend_exp != 1 else ''} waiting for approval",
+                "detail": "Big spending only shows in the estate statement once it's approved.",
+                "link": "/app/finances",
+            })
+        stale_repairs = requests_collection.count_documents({**estate_filter, "status": "reported", "created_at": {"$lt": now - timedelta(days=3)}})
+        if stale_repairs:
+            attention.append({
+                "key": "stale_repairs", "level": "info",
+                "title": f"{stale_repairs} repair request{'s' if stale_repairs != 1 else ''} not looked at in 3+ days",
+                "detail": "Assign someone or post an update so residents know it's being handled.",
+                "link": "/app/repairs",
+            })
     if residents_no_unit:
         attention.append({
             "key": "residents_no_unit", "level": "info",
@@ -2680,17 +2718,47 @@ async def get_dashboard(days: int = 30, current_user: Dict = Depends(get_current
         estate = None if role == "super_admin" else estates_collection.find_one({"_id": estate_id}, {"settings": 1, "name": 1})
         return serialize_doc(build_admin_analytics(estate_filter, days, estate))
 
+    now = datetime.utcnow()
+    me = current_user["_id"]
+    # Nigeria is UTC+1: "today" runs from local midnight.
+    local_midnight = (now + timedelta(hours=1)).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(hours=1)
+    open_alerts = list(alerts_collection.find({"estate_id": estate_id, "status": {"$in": ["active", "acknowledged"]}},
+                                              {"type": 1, "status": 1, "created_at": 1, "sender_name": 1, "message": 1, "acknowledged_by": 1}).sort("created_at", -1).limit(10))
+    base = {
+        "role": role,
+        "summary": {
+            "active_incidents": incidents_collection.count_documents({"estate_id": estate_id, "reporter_id": me, "status": {"$nin": ["resolved", "closed"]}}),
+            "total_visitors": passes_collection.count_documents({"estate_id": estate_id, "host_id": me}),
+            "total_alerts": alerts_collection.count_documents({"estate_id": estate_id, "sender_id": me, "status": {"$in": ["active", "acknowledged"]}}),
+            "active_alerts": len(open_alerts),
+            "total_users": 0,
+        },
+        "recentIncidents": list(incidents_collection.find({"estate_id": estate_id, "reporter_id": me}).sort("created_at", -1).limit(5)),
+        "estate_open_alerts": open_alerts,
+        "open_repairs": requests_collection.count_documents({"estate_id": estate_id, "status": {"$in": ["reported", "assigned", "in_progress"]},
+                                                             "$or": [{"visibility": "estate"}, {"reporter_id": me}]}),
+    }
+
+    if role in ("guard", "police"):
+        # Gate view: who is expected today, who already came in.
+        expected = list(passes_collection.find({
+            "estate_id": estate_id, "status": "active",
+            "valid_from": {"$lt": local_midnight + timedelta(days=1)}, "valid_until": {"$gte": now},
+        }, {"qr_code": 0}).sort("valid_from", 1).limit(50))
+        arrived = list(passes_collection.find({"estate_id": estate_id, "status": "used", "used_at": {"$gte": local_midnight}},
+                                              {"qr_code": 0}).sort("used_at", -1).limit(50))
+        base["gate"] = {"expected": expected, "arrived": arrived}
+        base["summary"]["total_visitors"] = len(arrived)
+        base["summary"]["active_incidents"] = incidents_collection.count_documents({"estate_id": estate_id, "status": {"$nin": ["resolved", "closed"]}})
     else:
-        data = {
-            "summary": {
-                "active_incidents": incidents_collection.count_documents({"estate_id": estate_id, "reporter_id": current_user["_id"], "status": {"$ne": "resolved"}}),
-                "total_visitors": passes_collection.count_documents({"estate_id": estate_id, "host_id": current_user["_id"]}),
-                "total_alerts": alerts_collection.count_documents({"estate_id": estate_id, "sender_id": current_user["_id"], "status": "active"}),
-                "total_users": 0
-            },
-            "recentIncidents": list(incidents_collection.find({"estate_id": estate_id, "reporter_id": current_user["_id"]}).sort("created_at", -1).limit(5))
-        }
-        return serialize_doc(data)
+        base["my_passes"] = list(passes_collection.find({"estate_id": estate_id, "host_id": me, "status": "active", "valid_until": {"$gte": now}},
+                                                        {"qr_code": 0}).sort("valid_from", 1).limit(5))
+        units = list(units_collection.find({"estate_id": estate_id, "$or": [{"occupant_user_ids": me}, {"payer_user_id": me}]}, {"label": 1, "credit": 1}))
+        due = sum(_unit_balance(u["_id"]) for u in units)
+        overdue = invoices_collection.count_documents({"unit_id": {"$in": [u["_id"] for u in units]}, "status": {"$in": ["unpaid", "part_paid"]}, "due_date": {"$lt": now}})
+        base["bills"] = {"has_unit": bool(units), "balance_due": due, "overdue_bills": overdue,
+                         "credit": sum(int(u.get("credit", 0)) for u in units)}
+    return serialize_doc(base)
 
 
 @app.get("/api/platform/stats")
@@ -2840,7 +2908,9 @@ async def sync_offline(actions: List[SyncAction], current_user: Dict = Depends(g
 async def get_visitor_passes(status: Optional[str] = None, start_date: Optional[str] = None, end_date: Optional[str] = None, current_user: Dict = Depends(get_current_user)):
     query_filter = {"estate_id": ObjectId(current_user["estate_id"])}
 
-    if current_user["role"].lower() not in ["admin", "super_admin"]:
+    # Guards work the gate, so they see every pass in the estate (not their
+    # own, which they never create). Residents only see their own.
+    if current_user["role"].lower() not in ["admin", "super_admin", "guard"]:
         query_filter["host_id"] = current_user["_id"]
 
     if status:
@@ -2851,7 +2921,8 @@ async def get_visitor_passes(status: Optional[str] = None, start_date: Optional[
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid date format")
 
-    passes = passes_collection.find(query_filter).sort("created_at", -1).limit(100)
+    projection = {"qr_code": 0} if current_user["role"].lower() == "guard" else None
+    passes = passes_collection.find(query_filter, projection).sort("created_at", -1).limit(100)
     return [serialize_doc(p) for p in passes]
 
 
@@ -3191,6 +3262,946 @@ async def change_password(data: dict, current_user: Dict = Depends(get_current_u
     )
 
     return {"message": "Password changed successfully"}
+
+
+# ===========================================================================
+# ESTATE MONEY (Phase 1): units, bills, payments, estate balance, expenses,
+# monthly statement — plus facility (repair) requests.
+#
+# NexHood never holds money. Residents pay the estate's own bank account
+# (bank transfer / cash for now; Paystack later). NexHood records who owes
+# what, who paid, and how the money was spent, so every resident can see it.
+# Amounts are whole naira (int).
+# ===========================================================================
+units_collection = db["units"]
+charges_collection = db["charges"]
+invoices_collection = db["invoices"]
+payments_collection = db["payments"]
+expenses_collection = db["expenses"]
+requests_collection = db["facility_requests"]
+try:
+    units_collection.create_index("estate_id")
+    invoices_collection.create_index([("estate_id", 1), ("unit_id", 1), ("status", 1)])
+    invoices_collection.create_index([("charge_id", 1), ("period", 1), ("unit_id", 1)])
+    payments_collection.create_index([("estate_id", 1), ("status", 1)])
+    expenses_collection.create_index([("estate_id", 1), ("date", -1)])
+    requests_collection.create_index([("estate_id", 1), ("created_at", -1)])
+except Exception as e:
+    logger.error(f"Finance index creation failed (non-fatal): {e}")
+
+CHARGE_CATEGORIES = ("service_charge", "security", "power", "water", "waste", "special", "other")
+CHARGE_FREQUENCIES = ("one_off", "monthly", "quarterly", "yearly")
+EXPENSE_CATEGORIES = ("diesel_power", "security_salaries", "repairs", "cleaning_waste", "water", "admin", "other")
+REQUEST_CATEGORIES = ("plumbing", "electrical", "road", "drainage", "waste", "gate_fence", "water", "other")
+REQUEST_STATUSES = ("reported", "assigned", "in_progress", "fixed", "closed")
+PAYMENT_METHODS = ("bank_transfer", "cash", "pos", "paystack")
+MAX_PROOF_CHARS = int(1.5 * 1024 * 1024)  # data URI size cap for receipts/proofs
+
+CATEGORY_LABEL = {
+    "service_charge": "Service charge", "security": "Security levy", "power": "Power / diesel",
+    "water": "Water", "waste": "Waste", "special": "Special levy", "other": "Other",
+    "diesel_power": "Diesel & power", "security_salaries": "Security salaries", "repairs": "Repairs & maintenance",
+    "cleaning_waste": "Cleaning & waste", "admin": "Admin & bank charges",
+}
+
+
+def _oid(value: str, what: str = "item") -> ObjectId:
+    if not value or not ObjectId.is_valid(str(value)):
+        raise HTTPException(status_code=404, detail=f"{what.capitalize()} not found")
+    return ObjectId(str(value))
+
+
+def _naira(n) -> str:
+    try:
+        return f"₦{int(round(float(n))):,}"
+    except (TypeError, ValueError):
+        return "₦0"
+
+
+def _estate_oid(user: Dict) -> ObjectId:
+    return ObjectId(user["estate_id"])
+
+
+def _finance_settings(estate_id: ObjectId) -> Dict:
+    estate = estates_collection.find_one({"_id": estate_id}, {"finance": 1}) or {}
+    return estate.get("finance") or {}
+
+
+def _is_admin(user: Dict) -> bool:
+    return user.get("role") in ("admin", "super_admin")
+
+
+def _unit_balance(unit_id: ObjectId) -> int:
+    """What a unit still owes across all open bills."""
+    agg = list(invoices_collection.aggregate([
+        {"$match": {"unit_id": unit_id, "status": {"$in": ["unpaid", "part_paid"]}}},
+        {"$group": {"_id": None, "due": {"$sum": {"$subtract": ["$amount", "$amount_paid"]}}}},
+    ]))
+    return int(agg[0]["due"]) if agg else 0
+
+
+def _apply_to_unit(unit_id: ObjectId, amount: int, preferred_invoice: Optional[ObjectId] = None) -> Dict:
+    """Spread `amount` over the unit's open bills (the chosen bill first, then
+    oldest first). Anything left over becomes estate-balance credit."""
+    remaining = int(amount)
+    applied = []
+    open_bills = list(invoices_collection.find({"unit_id": unit_id, "status": {"$in": ["unpaid", "part_paid"]}}).sort("due_date", 1))
+    if preferred_invoice:
+        open_bills.sort(key=lambda b: 0 if b["_id"] == preferred_invoice else 1)
+    for bill in open_bills:
+        if remaining <= 0:
+            break
+        due = int(bill["amount"]) - int(bill.get("amount_paid", 0))
+        if due <= 0:
+            continue
+        pay = min(due, remaining)
+        new_paid = int(bill.get("amount_paid", 0)) + pay
+        invoices_collection.update_one({"_id": bill["_id"]}, {"$set": {
+            "amount_paid": new_paid,
+            "status": "paid" if new_paid >= int(bill["amount"]) else "part_paid",
+            **({"paid_at": datetime.utcnow()} if new_paid >= int(bill["amount"]) else {}),
+        }})
+        applied.append({"invoice_id": bill["_id"], "amount": pay})
+        remaining -= pay
+    if remaining > 0:
+        units_collection.update_one({"_id": unit_id}, {"$inc": {"credit": remaining}})
+    return {"applied": applied, "to_credit": max(remaining, 0)}
+
+
+def _unit_payer_emails(unit: Dict) -> List[str]:
+    ids = [i for i in [unit.get("payer_user_id")] + list(unit.get("occupant_user_ids") or []) if i]
+    if not ids:
+        return []
+    return [u["email"] for u in users_collection.find({"_id": {"$in": ids}, "is_active": True}, {"email": 1}) if u.get("email")]
+
+
+def _serialize_unit(u: Dict, people: Optional[Dict] = None) -> Dict:
+    people = people or {}
+    occupants = [people.get(i) for i in (u.get("occupant_user_ids") or []) if people.get(i)]
+    payer = people.get(u.get("payer_user_id"))
+    return serialize_doc({
+        **u,
+        "credit": int(u.get("credit", 0)),
+        "balance_due": _unit_balance(u["_id"]),
+        "occupants": [{"id": str(p["_id"]), "name": p.get("name"), "role": p.get("role")} for p in occupants],
+        "payer": {"id": str(payer["_id"]), "name": payer.get("name")} if payer else None,
+    })
+
+
+# ---------------- finance settings ----------------
+class FinanceSettingsUpdate(BaseModel):
+    bank_name: Optional[str] = Field(None, max_length=60)
+    account_name: Optional[str] = Field(None, max_length=100)
+    account_number: Optional[str] = Field(None, max_length=20)
+    approver_user_id: Optional[str] = None
+    approval_threshold: Optional[int] = Field(None, ge=0)
+
+
+@app.get("/api/finance/settings")
+async def get_finance_settings(current_user: Dict = Depends(get_current_user)):
+    s = _finance_settings(_estate_oid(current_user))
+    approver = None
+    if s.get("approver_user_id"):
+        a = users_collection.find_one({"_id": s["approver_user_id"]}, {"name": 1})
+        approver = {"id": str(s["approver_user_id"]), "name": (a or {}).get("name")}
+    return {
+        "bank_name": s.get("bank_name"), "account_name": s.get("account_name"), "account_number": s.get("account_number"),
+        "approval_threshold": int(s.get("approval_threshold", 100000)), "approver": approver,
+    }
+
+
+@app.patch("/api/finance/settings")
+async def update_finance_settings(body: FinanceSettingsUpdate, current_user: Dict = Depends(require_admin)):
+    estate_id = _estate_oid(current_user)
+    changes = {}
+    data = body.dict(exclude_unset=True)
+    for k in ("bank_name", "account_name", "account_number", "approval_threshold"):
+        if k in data and data[k] is not None:
+            changes[f"finance.{k}"] = data[k].strip() if isinstance(data[k], str) else data[k]
+    if "approver_user_id" in data:
+        if data["approver_user_id"]:
+            approver = users_collection.find_one({"_id": _oid(data["approver_user_id"], "user"), "estate_id": estate_id, "role": "admin", "is_active": True})
+            if not approver:
+                raise HTTPException(status_code=400, detail="The approver must be an admin of this estate")
+            changes["finance.approver_user_id"] = approver["_id"]
+        else:
+            changes["finance.approver_user_id"] = None
+    if not changes:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+    estates_collection.update_one({"_id": estate_id}, {"$set": changes})
+    audit_logs_collection.insert_one({"user_id": current_user["_id"], "estate_id": estate_id, "action": "update_finance_settings",
+                                      "entity": "estate", "details": {k: str(v) for k, v in changes.items()}, "timestamp": datetime.utcnow()})
+    return await get_finance_settings(current_user)
+
+
+# ---------------- units ----------------
+class UnitCreate(BaseModel):
+    label: str = Field(..., min_length=1, max_length=60)
+    unit_type: Optional[str] = Field(None, max_length=40)
+    owner_name: Optional[str] = Field(None, max_length=80)
+    payer_user_id: Optional[str] = None
+    occupant_user_ids: Optional[List[str]] = None
+
+
+class UnitUpdate(BaseModel):
+    label: Optional[str] = Field(None, min_length=1, max_length=60)
+    unit_type: Optional[str] = Field(None, max_length=40)
+    owner_name: Optional[str] = Field(None, max_length=80)
+    payer_user_id: Optional[str] = None
+    occupant_user_ids: Optional[List[str]] = None
+    active: Optional[bool] = None
+
+
+def _resolve_members(estate_id: ObjectId, ids: Optional[List[str]]) -> List[ObjectId]:
+    out = []
+    for i in ids or []:
+        u = users_collection.find_one({"_id": _oid(i, "user"), "estate_id": estate_id}, {"_id": 1})
+        if not u:
+            raise HTTPException(status_code=400, detail="Everyone on a unit must belong to this estate")
+        out.append(u["_id"])
+    return out
+
+
+@app.get("/api/units")
+async def list_units(current_user: Dict = Depends(get_current_user)):
+    estate_id = _estate_oid(current_user)
+    q = {"estate_id": estate_id}
+    if not _is_admin(current_user):
+        q["$or"] = [{"occupant_user_ids": current_user["_id"]}, {"payer_user_id": current_user["_id"]}]
+    units = list(units_collection.find(q).sort("label", 1))
+    ids = set()
+    for u in units:
+        ids.update(u.get("occupant_user_ids") or [])
+        if u.get("payer_user_id"):
+            ids.add(u["payer_user_id"])
+    people = {p["_id"]: p for p in users_collection.find({"_id": {"$in": list(ids)}}, {"name": 1, "role": 1})}
+    return [_serialize_unit(u, people) for u in units]
+
+
+@app.post("/api/units")
+async def create_unit(body: UnitCreate, current_user: Dict = Depends(require_admin)):
+    estate_id = _estate_oid(current_user)
+    label = re.sub(r"\s+", " ", body.label).strip()
+    if units_collection.find_one({"estate_id": estate_id, "label": {"$regex": f"^{re.escape(label)}$", "$options": "i"}}):
+        raise HTTPException(status_code=400, detail="A unit with that name already exists")
+    occupants = _resolve_members(estate_id, body.occupant_user_ids)
+    payer = _resolve_members(estate_id, [body.payer_user_id])[0] if body.payer_user_id else (occupants[0] if occupants else None)
+    doc = {"estate_id": estate_id, "label": label, "unit_type": (body.unit_type or "").strip() or None,
+           "owner_name": body.owner_name, "occupant_user_ids": occupants, "payer_user_id": payer,
+           "credit": 0, "active": True, "created_at": datetime.utcnow()}
+    res = units_collection.insert_one(doc)
+    if occupants:
+        users_collection.update_many({"_id": {"$in": occupants}}, {"$set": {"unit_id": res.inserted_id, "apartment": label}})
+    return _serialize_unit({**doc, "_id": res.inserted_id})
+
+
+@app.patch("/api/units/{unit_id}")
+async def update_unit(unit_id: str, body: UnitUpdate, current_user: Dict = Depends(require_admin)):
+    estate_id = _estate_oid(current_user)
+    unit = units_collection.find_one({"_id": _oid(unit_id, "unit"), "estate_id": estate_id})
+    if not unit:
+        raise HTTPException(status_code=404, detail="Unit not found")
+    data = body.dict(exclude_unset=True)
+    changes = {}
+    if "label" in data and data["label"]:
+        changes["label"] = re.sub(r"\s+", " ", data["label"]).strip()
+    for k in ("unit_type", "owner_name", "active"):
+        if k in data:
+            changes[k] = data[k]
+    if "occupant_user_ids" in data:
+        occ = _resolve_members(estate_id, data["occupant_user_ids"])
+        changes["occupant_user_ids"] = occ
+        users_collection.update_many({"unit_id": unit["_id"], "_id": {"$nin": occ}}, {"$unset": {"unit_id": ""}})
+        if occ:
+            users_collection.update_many({"_id": {"$in": occ}}, {"$set": {"unit_id": unit["_id"], "apartment": changes.get("label", unit["label"])}})
+    if "payer_user_id" in data:
+        changes["payer_user_id"] = _resolve_members(estate_id, [data["payer_user_id"]])[0] if data["payer_user_id"] else None
+    if changes:
+        units_collection.update_one({"_id": unit["_id"]}, {"$set": changes})
+    return _serialize_unit(units_collection.find_one({"_id": unit["_id"]}))
+
+
+@app.post("/api/units/import-from-residents")
+async def import_units_from_residents(current_user: Dict = Depends(require_admin)):
+    """Quick start: turn every resident's flat number into a unit and link
+    them to it. Residents with the same flat number share one unit."""
+    estate_id = _estate_oid(current_user)
+    created, linked = 0, 0
+    for r in users_collection.find({"estate_id": estate_id, "role": "resident", "is_active": True}):
+        label = re.sub(r"\s+", " ", (r.get("apartment") or "")).strip()
+        if not label or r.get("unit_id"):
+            continue
+        unit = units_collection.find_one({"estate_id": estate_id, "label": {"$regex": f"^{re.escape(label)}$", "$options": "i"}})
+        if not unit:
+            uid = units_collection.insert_one({"estate_id": estate_id, "label": label, "unit_type": None, "owner_name": None,
+                                               "occupant_user_ids": [r["_id"]], "payer_user_id": r["_id"], "credit": 0,
+                                               "active": True, "created_at": datetime.utcnow()}).inserted_id
+            created += 1
+        else:
+            uid = unit["_id"]
+            units_collection.update_one({"_id": uid}, {"$addToSet": {"occupant_user_ids": r["_id"]}})
+            if not unit.get("payer_user_id"):
+                units_collection.update_one({"_id": uid}, {"$set": {"payer_user_id": r["_id"]}})
+        users_collection.update_one({"_id": r["_id"]}, {"$set": {"unit_id": uid}})
+        linked += 1
+    return {"created": created, "linked": linked}
+
+
+# ---------------- charges (bill types) & invoices ----------------
+class ChargeCreate(BaseModel):
+    name: str = Field(..., min_length=2, max_length=80)
+    category: str = "service_charge"
+    amount: int = Field(..., gt=0)
+    frequency: str = "monthly"
+    type_amounts: Optional[Dict[str, int]] = None  # e.g. {"duplex": 40000}
+
+    @field_validator("category")
+    @classmethod
+    def _cat(cls, v):
+        if v not in CHARGE_CATEGORIES:
+            raise ValueError("Unknown bill category")
+        return v
+
+    @field_validator("frequency")
+    @classmethod
+    def _freq(cls, v):
+        if v not in CHARGE_FREQUENCIES:
+            raise ValueError("Unknown frequency")
+        return v
+
+
+class ChargeUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=2, max_length=80)
+    amount: Optional[int] = Field(None, gt=0)
+    type_amounts: Optional[Dict[str, int]] = None
+    active: Optional[bool] = None
+
+
+class IssueBills(BaseModel):
+    period: str = Field(..., min_length=4, max_length=20)  # e.g. "2026-10" or "2026" or "Q4 2026"
+    due_date: datetime
+    unit_ids: Optional[List[str]] = None  # default: all active units
+
+
+@app.get("/api/charges")
+async def list_charges(current_user: Dict = Depends(get_current_user)):
+    return [serialize_doc(c) for c in charges_collection.find({"estate_id": _estate_oid(current_user)}).sort("created_at", -1)]
+
+
+@app.post("/api/charges")
+async def create_charge(body: ChargeCreate, current_user: Dict = Depends(require_admin)):
+    doc = {**body.dict(), "estate_id": _estate_oid(current_user), "active": True,
+           "created_by": current_user["_id"], "created_at": datetime.utcnow()}
+    res = charges_collection.insert_one(doc)
+    return serialize_doc({**doc, "_id": res.inserted_id})
+
+
+@app.patch("/api/charges/{charge_id}")
+async def update_charge(charge_id: str, body: ChargeUpdate, current_user: Dict = Depends(require_admin)):
+    q = {"_id": _oid(charge_id, "bill type"), "estate_id": _estate_oid(current_user)}
+    if not charges_collection.find_one(q):
+        raise HTTPException(status_code=404, detail="Bill type not found")
+    changes = {k: v for k, v in body.dict(exclude_unset=True).items()}
+    if changes:
+        charges_collection.update_one(q, {"$set": changes})
+    return serialize_doc(charges_collection.find_one(q))
+
+
+@app.post("/api/charges/{charge_id}/issue")
+async def issue_bills(charge_id: str, body: IssueBills, background_tasks: BackgroundTasks, current_user: Dict = Depends(require_admin)):
+    """Create one bill per unit for this charge and period. Safe to run
+    twice: units that already have this bill for this period are skipped.
+    Any estate-balance credit a unit has is used up first."""
+    estate_id = _estate_oid(current_user)
+    charge = charges_collection.find_one({"_id": _oid(charge_id, "bill type"), "estate_id": estate_id})
+    if not charge or not charge.get("active", True):
+        raise HTTPException(status_code=404, detail="Bill type not found")
+    uq = {"estate_id": estate_id, "active": True}
+    if body.unit_ids:
+        uq["_id"] = {"$in": [_oid(u, "unit") for u in body.unit_ids]}
+    units = list(units_collection.find(uq))
+    if not units:
+        raise HTTPException(status_code=400, detail="Add your houses/flats under Units before issuing bills")
+    due = body.due_date
+    if due.tzinfo is not None:
+        due = (due - due.utcoffset()).replace(tzinfo=None)
+    period = body.period.strip()
+    issued, skipped, emails = 0, 0, []
+    for u in units:
+        if invoices_collection.find_one({"charge_id": charge["_id"], "period": period, "unit_id": u["_id"], "status": {"$ne": "void"}}):
+            skipped += 1
+            continue
+        amount = int((charge.get("type_amounts") or {}).get(u.get("unit_type") or "", charge["amount"]))
+        inv = {"estate_id": estate_id, "unit_id": u["_id"], "unit_label": u["label"], "charge_id": charge["_id"],
+               "title": f"{charge['name']} — {period}", "category": charge["category"], "period": period,
+               "amount": amount, "amount_paid": 0, "status": "unpaid", "due_date": due,
+               "created_by": current_user["_id"], "created_at": datetime.utcnow()}
+        res = invoices_collection.insert_one(inv)
+        credit = int(u.get("credit", 0))
+        if credit > 0:
+            use = min(credit, amount)
+            units_collection.update_one({"_id": u["_id"]}, {"$inc": {"credit": -use}})
+            invoices_collection.update_one({"_id": res.inserted_id}, {"$set": {
+                "amount_paid": use, "status": "paid" if use >= amount else "part_paid",
+                "paid_from_credit": use, **({"paid_at": datetime.utcnow()} if use >= amount else {})}})
+        issued += 1
+        emails.extend(_unit_payer_emails(u))
+    audit_logs_collection.insert_one({"user_id": current_user["_id"], "estate_id": estate_id, "action": "issue_bills", "entity": "charge",
+                                      "entity_id": str(charge["_id"]), "details": {"name": charge["name"], "period": period, "count": issued},
+                                      "timestamp": datetime.utcnow()})
+    if emails:
+        fin = _finance_settings(estate_id)
+        bank = (f"<p>Pay by bank transfer to <strong>{html.escape(fin.get('account_name') or '')}</strong>, "
+                f"{html.escape(fin.get('bank_name') or '')} {html.escape(fin.get('account_number') or '')}, then tap "
+                f"“I’ve paid” in NexHood and attach your receipt.</p>") if fin.get("account_number") else ""
+        background_tasks.add_task(notify_by_email, emails, f"New bill: {charge['name']} — {period}", branded_email(
+            "You have a new estate bill",
+            f"<p><strong>{html.escape(charge['name'])}</strong> for {html.escape(period)} is now due "
+            f"(by {due.strftime('%d %b %Y')}).</p>{bank}"
+            f"<p style='margin:20px 0;'><a href=\"{FRONTEND_URL}/app/payments\" style=\"background:#1e2a5e;color:#ffffff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:600;display:inline-block;\">View my bills</a></p>"))
+    return {"issued": issued, "skipped": skipped}
+
+
+@app.get("/api/invoices")
+async def list_invoices(status: Optional[str] = None, unit_id: Optional[str] = None, period: Optional[str] = None,
+                        current_user: Dict = Depends(get_current_user)):
+    estate_id = _estate_oid(current_user)
+    q: Dict = {"estate_id": estate_id}
+    if _is_admin(current_user):
+        if unit_id:
+            q["unit_id"] = _oid(unit_id, "unit")
+    else:
+        my_units = [u["_id"] for u in units_collection.find({"estate_id": estate_id, "$or": [
+            {"occupant_user_ids": current_user["_id"]}, {"payer_user_id": current_user["_id"]}]}, {"_id": 1})]
+        q["unit_id"] = {"$in": my_units}
+    if status == "open":
+        q["status"] = {"$in": ["unpaid", "part_paid"]}
+    elif status:
+        q["status"] = status
+    if period:
+        q["period"] = period
+    now = datetime.utcnow()
+    out = []
+    for inv in invoices_collection.find(q).sort("due_date", -1).limit(500):
+        d = serialize_doc(inv)
+        d["balance"] = int(inv["amount"]) - int(inv.get("amount_paid", 0))
+        d["overdue"] = inv["status"] in ("unpaid", "part_paid") and inv.get("due_date") and inv["due_date"] < now
+        out.append(d)
+    return out
+
+
+@app.post("/api/invoices/{invoice_id}/void")
+async def void_invoice(invoice_id: str, current_user: Dict = Depends(require_admin)):
+    inv = invoices_collection.find_one({"_id": _oid(invoice_id, "bill"), "estate_id": _estate_oid(current_user)})
+    if not inv:
+        raise HTTPException(status_code=404, detail="Bill not found")
+    if int(inv.get("amount_paid", 0)) > 0:
+        raise HTTPException(status_code=400, detail="This bill already has payments on it. Record a refund instead of cancelling.")
+    invoices_collection.update_one({"_id": inv["_id"]}, {"$set": {"status": "void", "voided_by": current_user["_id"], "voided_at": datetime.utcnow()}})
+    return {"message": "Bill cancelled"}
+
+
+# ---------------- payments ----------------
+class PaymentCreate(BaseModel):
+    amount: int = Field(..., gt=0)
+    method: str = "bank_transfer"
+    reference: Optional[str] = Field(None, max_length=80)
+    invoice_id: Optional[str] = None
+    unit_id: Optional[str] = None  # admin recording for a unit
+    proof_image: Optional[str] = None
+    note: Optional[str] = Field(None, max_length=300)
+
+    @field_validator("method")
+    @classmethod
+    def _m(cls, v):
+        if v not in PAYMENT_METHODS:
+            raise ValueError("Unknown payment method")
+        return v
+
+    @field_validator("proof_image")
+    @classmethod
+    def _p(cls, v):
+        if v and (len(v) > MAX_PROOF_CHARS or not v.startswith("data:image/")):
+            raise ValueError("Receipt must be an image under about 1MB")
+        return v
+
+
+class PaymentDecision(BaseModel):
+    reason: Optional[str] = Field(None, max_length=300)
+
+
+def _confirm_payment(payment: Dict, admin: Dict, background_tasks: Optional[BackgroundTasks] = None) -> Dict:
+    result = _apply_to_unit(payment["unit_id"], int(payment["amount"]), payment.get("invoice_id"))
+    payments_collection.update_one({"_id": payment["_id"]}, {"$set": {
+        "status": "confirmed", "confirmed_by": admin["_id"], "confirmed_at": datetime.utcnow(),
+        "allocation": result["applied"], "to_credit": result["to_credit"]}})
+    audit_logs_collection.insert_one({"user_id": admin["_id"], "estate_id": payment["estate_id"], "action": "confirm_payment",
+                                      "entity": "payment", "entity_id": str(payment["_id"]),
+                                      "details": {"amount": payment["amount"], "unit": payment.get("unit_label")}, "timestamp": datetime.utcnow()})
+    payer = users_collection.find_one({"_id": payment.get("payer_user_id")}, {"email": 1, "name": 1}) if payment.get("payer_user_id") else None
+    if background_tasks and payer and payer.get("email"):
+        extra = f"<p>{_naira(result['to_credit'])} was added to your estate balance for future bills.</p>" if result["to_credit"] else ""
+        background_tasks.add_task(send_email, payer["email"], f"Payment received: {_naira(payment['amount'])}", branded_email(
+            "Payment confirmed",
+            f"<p>Hi {html.escape((payer.get('name') or '').split(' ')[0])},</p>"
+            f"<p>Your estate confirmed your payment of <strong>{_naira(payment['amount'])}</strong> for {html.escape(payment.get('unit_label') or 'your unit')}.</p>{extra}"
+            f"<p>You can see your receipt and balance under Bills in NexHood.</p>"))
+    return result
+
+
+@app.post("/api/payments")
+async def create_payment(body: PaymentCreate, background_tasks: BackgroundTasks, current_user: Dict = Depends(get_current_user)):
+    """Resident: "I've paid" (bank transfer/cash) with a receipt photo. It
+    waits for an admin to confirm the money arrived. Admin: records a
+    payment they received for a unit; it's confirmed straight away."""
+    estate_id = _estate_oid(current_user)
+    invoice = None
+    if body.invoice_id:
+        invoice = invoices_collection.find_one({"_id": _oid(body.invoice_id, "bill"), "estate_id": estate_id})
+        if not invoice:
+            raise HTTPException(status_code=404, detail="Bill not found")
+    if _is_admin(current_user):
+        unit_oid = invoice["unit_id"] if invoice else _oid(body.unit_id, "unit")
+        unit = units_collection.find_one({"_id": unit_oid, "estate_id": estate_id})
+    else:
+        mine = {"estate_id": estate_id, "$or": [{"occupant_user_ids": current_user["_id"]}, {"payer_user_id": current_user["_id"]}]}
+        unit = units_collection.find_one({**mine, "_id": invoice["unit_id"]}) if invoice else units_collection.find_one(mine)
+        if body.method == "paystack":
+            raise HTTPException(status_code=400, detail="Online payment isn't available yet")
+        if not body.proof_image and not body.reference:
+            raise HTTPException(status_code=400, detail="Add the transfer reference or a photo of your receipt")
+    if not unit:
+        raise HTTPException(status_code=404, detail="Your house/flat isn't set up yet. Ask your estate admin to add it.")
+    doc = {"estate_id": estate_id, "unit_id": unit["_id"], "unit_label": unit["label"],
+           "invoice_id": invoice["_id"] if invoice else None, "payer_user_id": current_user["_id"] if not _is_admin(current_user) else unit.get("payer_user_id"),
+           "payer_name": current_user.get("name") if not _is_admin(current_user) else None,
+           "amount": int(body.amount), "method": body.method, "reference": body.reference, "note": body.note,
+           "proof_image": body.proof_image, "status": "pending", "recorded_by": current_user["_id"], "created_at": datetime.utcnow()}
+    res = payments_collection.insert_one(doc)
+    doc["_id"] = res.inserted_id
+    if _is_admin(current_user):
+        _confirm_payment(doc, current_user, background_tasks)
+    else:
+        admins = [a["email"] for a in users_collection.find({"estate_id": estate_id, "role": "admin", "is_active": True}, {"email": 1}) if a.get("email")]
+        background_tasks.add_task(notify_by_email, admins, f"Payment to confirm: {_naira(body.amount)} from {unit['label']}", branded_email(
+            "A resident says they've paid",
+            f"<p><strong>{html.escape(current_user.get('name') or 'A resident')}</strong> ({html.escape(unit['label'])}) reported paying "
+            f"<strong>{_naira(body.amount)}</strong> by {body.method.replace('_', ' ')}"
+            f"{' (ref ' + html.escape(body.reference) + ')' if body.reference else ''}.</p>"
+            f"<p>Check your bank, then confirm it in NexHood under Bills → Payments to confirm.</p>"))
+    return serialize_doc({k: v for k, v in payments_collection.find_one({"_id": res.inserted_id}).items() if k != "proof_image"})
+
+
+@app.get("/api/payments")
+async def list_payments(status: Optional[str] = None, current_user: Dict = Depends(get_current_user)):
+    q: Dict = {"estate_id": _estate_oid(current_user)}
+    if not _is_admin(current_user):
+        q["payer_user_id"] = current_user["_id"]
+    if status:
+        q["status"] = status
+    out = []
+    for p in payments_collection.find(q, {"proof_image": 0}).sort("created_at", -1).limit(300):
+        d = serialize_doc(p)
+        d["has_proof"] = bool(payments_collection.count_documents({"_id": p["_id"], "proof_image": {"$nin": [None, ""]}}))
+        out.append(d)
+    return out
+
+
+@app.get("/api/payments/{payment_id}/proof")
+async def get_payment_proof(payment_id: str, current_user: Dict = Depends(get_current_user)):
+    p = payments_collection.find_one({"_id": _oid(payment_id, "payment"), "estate_id": _estate_oid(current_user)}, {"proof_image": 1, "payer_user_id": 1})
+    if not p or (not _is_admin(current_user) and p.get("payer_user_id") != current_user["_id"]):
+        raise HTTPException(status_code=404, detail="Payment not found")
+    return {"proof_image": p.get("proof_image")}
+
+
+@app.post("/api/payments/{payment_id}/confirm")
+async def confirm_payment(payment_id: str, background_tasks: BackgroundTasks, current_user: Dict = Depends(require_admin)):
+    p = payments_collection.find_one({"_id": _oid(payment_id, "payment"), "estate_id": _estate_oid(current_user)})
+    if not p:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    if p["status"] != "pending":
+        raise HTTPException(status_code=400, detail=f"This payment is already {p['status']}")
+    result = _confirm_payment(p, current_user, background_tasks)
+    return {"message": "Payment confirmed", **serialize_doc(result)}
+
+
+@app.post("/api/payments/{payment_id}/reject")
+async def reject_payment(payment_id: str, body: PaymentDecision, background_tasks: BackgroundTasks, current_user: Dict = Depends(require_admin)):
+    p = payments_collection.find_one({"_id": _oid(payment_id, "payment"), "estate_id": _estate_oid(current_user)})
+    if not p or p["status"] != "pending":
+        raise HTTPException(status_code=404, detail="Pending payment not found")
+    payments_collection.update_one({"_id": p["_id"]}, {"$set": {"status": "rejected", "rejected_by": current_user["_id"],
+                                                                "rejected_at": datetime.utcnow(), "reject_reason": body.reason}})
+    payer = users_collection.find_one({"_id": p.get("payer_user_id")}, {"email": 1}) if p.get("payer_user_id") else None
+    if payer and payer.get("email"):
+        background_tasks.add_task(send_email, payer["email"], "We couldn't confirm your payment", branded_email(
+            "Payment not confirmed",
+            f"<p>Your estate couldn't confirm your payment of {_naira(p['amount'])}.</p>"
+            f"<p>{html.escape(body.reason or 'Please contact your estate admin.')}</p>"))
+    return {"message": "Payment marked as not received"}
+
+
+# ---------------- expenses (with approver for big amounts) ----------------
+class ExpenseCreate(BaseModel):
+    category: str
+    amount: int = Field(..., gt=0)
+    vendor: Optional[str] = Field(None, max_length=100)
+    description: str = Field(..., min_length=3, max_length=500)
+    date: datetime
+    receipt_image: Optional[str] = None
+    request_id: Optional[str] = None
+
+    @field_validator("category")
+    @classmethod
+    def _c(cls, v):
+        if v not in EXPENSE_CATEGORIES:
+            raise ValueError("Unknown expense category")
+        return v
+
+    @field_validator("receipt_image")
+    @classmethod
+    def _r(cls, v):
+        if v and (len(v) > MAX_PROOF_CHARS or not v.startswith("data:image/")):
+            raise ValueError("Receipt must be an image under about 1MB")
+        return v
+
+
+def _approver_for(estate_id: ObjectId) -> Optional[ObjectId]:
+    return _finance_settings(estate_id).get("approver_user_id")
+
+
+@app.post("/api/expenses")
+async def create_expense(body: ExpenseCreate, background_tasks: BackgroundTasks, current_user: Dict = Depends(require_admin)):
+    """Spending from estate funds. Anything at or above the estate's
+    approval threshold waits for the named approver before it counts in
+    the statement. Expenses are never deleted: a mistake is voided, and the
+    void stays visible."""
+    estate_id = _estate_oid(current_user)
+    fin = _finance_settings(estate_id)
+    threshold = int(fin.get("approval_threshold", 100000))
+    approver = fin.get("approver_user_id")
+    d = body.date if body.date.tzinfo is None else (body.date - body.date.utcoffset()).replace(tzinfo=None)
+    needs_approval = body.amount >= threshold
+    self_approved = needs_approval and approver == current_user["_id"]
+    status = "approved" if (not needs_approval or self_approved) else "pending_approval"
+    linked_request = None
+    if body.request_id:
+        linked_request = requests_collection.find_one({"_id": _oid(body.request_id, "request"), "estate_id": estate_id})
+    doc = {"estate_id": estate_id, "category": body.category, "amount": int(body.amount), "vendor": body.vendor,
+           "description": body.description.strip(), "date": d, "receipt_image": body.receipt_image,
+           "request_id": linked_request["_id"] if linked_request else None, "request_title": (linked_request or {}).get("title"),
+           "status": status, "self_approved": self_approved, "created_by": current_user["_id"], "created_by_name": current_user.get("name"),
+           "created_at": datetime.utcnow(),
+           **({"approved_by": current_user["_id"], "approved_at": datetime.utcnow()} if status == "approved" else {})}
+    res = expenses_collection.insert_one(doc)
+    audit_logs_collection.insert_one({"user_id": current_user["_id"], "estate_id": estate_id, "action": "create", "entity": "expense",
+                                      "entity_id": str(res.inserted_id), "details": {"amount": doc["amount"], "category": doc["category"], "status": status},
+                                      "timestamp": datetime.utcnow()})
+    if status == "pending_approval":
+        target = approver or None
+        emails = []
+        if target:
+            a = users_collection.find_one({"_id": target}, {"email": 1})
+            emails = [a["email"]] if a and a.get("email") else []
+        else:
+            emails = [a["email"] for a in users_collection.find({"estate_id": estate_id, "role": "admin", "is_active": True, "_id": {"$ne": current_user["_id"]}}, {"email": 1}) if a.get("email")]
+        background_tasks.add_task(notify_by_email, emails, f"Approve spending: {_naira(body.amount)}", branded_email(
+            "An expense needs your approval",
+            f"<p>{html.escape(current_user.get('name') or 'An admin')} recorded <strong>{_naira(body.amount)}</strong> for "
+            f"{html.escape(CATEGORY_LABEL.get(body.category, body.category))}: {html.escape(body.description)}.</p>"
+            f"<p>It won't appear in the estate statement until you approve it in NexHood under Estate finances.</p>"))
+    return serialize_doc({k: v for k, v in doc.items() if k != "receipt_image"} | {"_id": res.inserted_id, "has_receipt": bool(body.receipt_image)})
+
+
+@app.get("/api/expenses")
+async def list_expenses(month: Optional[str] = None, status: Optional[str] = None, current_user: Dict = Depends(get_current_user)):
+    estate_id = _estate_oid(current_user)
+    q: Dict = {"estate_id": estate_id}
+    if not _is_admin(current_user):
+        q["status"] = {"$in": ["approved", "void"]}
+    elif status:
+        q["status"] = status
+    if month:
+        try:
+            start = datetime.strptime(month, "%Y-%m")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Month must look like 2026-10")
+        end = (start + timedelta(days=32)).replace(day=1)
+        q["date"] = {"$gte": start, "$lt": end}
+    out = []
+    for e in expenses_collection.find(q, {"receipt_image": 0}).sort("date", -1).limit(500):
+        d = serialize_doc(e)
+        d["has_receipt"] = bool(expenses_collection.count_documents({"_id": e["_id"], "receipt_image": {"$nin": [None, ""]}}))
+        out.append(d)
+    return out
+
+
+@app.get("/api/expenses/{expense_id}/receipt")
+async def get_expense_receipt(expense_id: str, current_user: Dict = Depends(get_current_user)):
+    e = expenses_collection.find_one({"_id": _oid(expense_id, "expense"), "estate_id": _estate_oid(current_user)}, {"receipt_image": 1, "status": 1})
+    if not e or (not _is_admin(current_user) and e.get("status") not in ("approved", "void")):
+        raise HTTPException(status_code=404, detail="Expense not found")
+    return {"receipt_image": e.get("receipt_image")}
+
+
+@app.post("/api/expenses/{expense_id}/approve")
+async def approve_expense(expense_id: str, current_user: Dict = Depends(require_admin)):
+    estate_id = _estate_oid(current_user)
+    e = expenses_collection.find_one({"_id": _oid(expense_id, "expense"), "estate_id": estate_id})
+    if not e or e["status"] != "pending_approval":
+        raise HTTPException(status_code=404, detail="Nothing waiting for approval here")
+    approver = _approver_for(estate_id)
+    if approver and approver != current_user["_id"]:
+        raise HTTPException(status_code=403, detail="Only the estate's finance approver can approve this")
+    if not approver and e.get("created_by") == current_user["_id"]:
+        raise HTTPException(status_code=403, detail="Another admin has to approve spending you recorded. Or set a finance approver in Settings.")
+    expenses_collection.update_one({"_id": e["_id"]}, {"$set": {"status": "approved", "approved_by": current_user["_id"],
+                                                                "approved_by_name": current_user.get("name"), "approved_at": datetime.utcnow()}})
+    audit_logs_collection.insert_one({"user_id": current_user["_id"], "estate_id": estate_id, "action": "approve", "entity": "expense",
+                                      "entity_id": str(e["_id"]), "details": {"amount": e["amount"]}, "timestamp": datetime.utcnow()})
+    return {"message": "Approved"}
+
+
+@app.post("/api/expenses/{expense_id}/reject")
+async def reject_expense(expense_id: str, body: PaymentDecision, current_user: Dict = Depends(require_admin)):
+    estate_id = _estate_oid(current_user)
+    e = expenses_collection.find_one({"_id": _oid(expense_id, "expense"), "estate_id": estate_id})
+    if not e or e["status"] != "pending_approval":
+        raise HTTPException(status_code=404, detail="Nothing waiting for approval here")
+    approver = _approver_for(estate_id)
+    if approver and approver != current_user["_id"]:
+        raise HTTPException(status_code=403, detail="Only the estate's finance approver can decide this")
+    expenses_collection.update_one({"_id": e["_id"]}, {"$set": {"status": "rejected", "rejected_by": current_user["_id"],
+                                                                "reject_reason": body.reason, "rejected_at": datetime.utcnow()}})
+    return {"message": "Rejected"}
+
+
+@app.post("/api/expenses/{expense_id}/void")
+async def void_expense(expense_id: str, body: PaymentDecision, current_user: Dict = Depends(require_admin)):
+    e = expenses_collection.find_one({"_id": _oid(expense_id, "expense"), "estate_id": _estate_oid(current_user)})
+    if not e or e["status"] not in ("approved", "pending_approval"):
+        raise HTTPException(status_code=404, detail="Expense not found")
+    if not (body.reason or "").strip():
+        raise HTTPException(status_code=400, detail="Say why it's being voided. Residents will see it.")
+    expenses_collection.update_one({"_id": e["_id"]}, {"$set": {"status": "void", "voided_by": current_user["_id"],
+                                                                "void_reason": body.reason.strip(), "voided_at": datetime.utcnow()}})
+    audit_logs_collection.insert_one({"user_id": current_user["_id"], "estate_id": e["estate_id"], "action": "void", "entity": "expense",
+                                      "entity_id": str(e["_id"]), "details": {"amount": e["amount"], "reason": body.reason}, "timestamp": datetime.utcnow()})
+    return {"message": "Expense voided"}
+
+
+# ---------------- statement & summaries ----------------
+def _sum(coll, match: Dict, field: str) -> int:
+    agg = list(coll.aggregate([{"$match": match}, {"$group": {"_id": None, "t": {"$sum": f"${field}"}}}]))
+    return int(agg[0]["t"]) if agg else 0
+
+
+@app.get("/api/finance/statement")
+async def finance_statement(month: Optional[str] = None, current_user: Dict = Depends(get_current_user)):
+    """The monthly "where the money went" statement every resident can see."""
+    estate_id = _estate_oid(current_user)
+    now = datetime.utcnow()
+    try:
+        start = datetime.strptime(month, "%Y-%m") if month else datetime(now.year, now.month, 1)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Month must look like 2026-10")
+    end = (start + timedelta(days=32)).replace(day=1)
+    paid_before = _sum(payments_collection, {"estate_id": estate_id, "status": "confirmed", "confirmed_at": {"$lt": start}}, "amount")
+    spent_before = _sum(expenses_collection, {"estate_id": estate_id, "status": "approved", "date": {"$lt": start}}, "amount")
+    collected = _sum(payments_collection, {"estate_id": estate_id, "status": "confirmed", "confirmed_at": {"$gte": start, "$lt": end}}, "amount")
+    by_cat = list(expenses_collection.aggregate([
+        {"$match": {"estate_id": estate_id, "status": "approved", "date": {"$gte": start, "$lt": end}}},
+        {"$group": {"_id": "$category", "total": {"$sum": "$amount"}, "count": {"$sum": 1}}},
+        {"$sort": {"total": -1}},
+    ]))
+    spent = sum(int(c["total"]) for c in by_cat)
+    opening = paid_before - spent_before
+    billed = _sum(invoices_collection, {"estate_id": estate_id, "status": {"$ne": "void"}, "due_date": {"$gte": start, "$lt": end}}, "amount")
+    billed_paid = _sum(invoices_collection, {"estate_id": estate_id, "status": {"$ne": "void"}, "due_date": {"$gte": start, "$lt": end}}, "amount_paid")
+    outstanding = _sum(invoices_collection, {"estate_id": estate_id, "status": {"$in": ["unpaid", "part_paid"]}}, "amount") - \
+        _sum(invoices_collection, {"estate_id": estate_id, "status": {"$in": ["unpaid", "part_paid"]}}, "amount_paid")
+    units_total = units_collection.count_documents({"estate_id": estate_id, "active": True})
+    units_owing = len(invoices_collection.distinct("unit_id", {"estate_id": estate_id, "status": {"$in": ["unpaid", "part_paid"]}}))
+    return {
+        "month": start.strftime("%Y-%m"),
+        "opening_balance": opening,
+        "collected": collected,
+        "spent": spent,
+        "closing_balance": opening + collected - spent,
+        "spending": [{"category": c["_id"], "label": CATEGORY_LABEL.get(c["_id"], c["_id"]), "total": int(c["total"]), "count": c["count"]} for c in by_cat],
+        "billed_this_month": billed,
+        "collection_rate_pct": round(billed_paid / billed * 100) if billed else None,
+        "outstanding_total": max(outstanding, 0),
+        "units_total": units_total,
+        "units_owing": units_owing,
+        "pending_approval": expenses_collection.count_documents({"estate_id": estate_id, "status": "pending_approval"}) if _is_admin(current_user) else None,
+    }
+
+
+@app.get("/api/finance/arrears")
+async def finance_arrears(current_user: Dict = Depends(require_admin)):
+    estate_id = _estate_oid(current_user)
+    rows = list(invoices_collection.aggregate([
+        {"$match": {"estate_id": estate_id, "status": {"$in": ["unpaid", "part_paid"]}}},
+        {"$group": {"_id": "$unit_id", "label": {"$first": "$unit_label"}, "due": {"$sum": {"$subtract": ["$amount", "$amount_paid"]}},
+                    "bills": {"$sum": 1}, "oldest": {"$min": "$due_date"}}},
+        {"$sort": {"due": -1}},
+    ]))
+    return [serialize_doc({"unit_id": r["_id"], "label": r["label"], "due": int(r["due"]), "bills": r["bills"], "oldest_due": r["oldest"]}) for r in rows]
+
+
+@app.get("/api/finance/me")
+async def finance_me(current_user: Dict = Depends(get_current_user)):
+    estate_id = _estate_oid(current_user)
+    units = list(units_collection.find({"estate_id": estate_id, "$or": [{"occupant_user_ids": current_user["_id"]}, {"payer_user_id": current_user["_id"]}]}))
+    fin = _finance_settings(estate_id)
+    return {
+        "units": [{"id": str(u["_id"]), "label": u["label"], "credit": int(u.get("credit", 0)), "balance_due": _unit_balance(u["_id"]),
+                   "is_payer": u.get("payer_user_id") == current_user["_id"]} for u in units],
+        "bank": {"bank_name": fin.get("bank_name"), "account_name": fin.get("account_name"), "account_number": fin.get("account_number")},
+        "pending_payments": payments_collection.count_documents({"estate_id": estate_id, "payer_user_id": current_user["_id"], "status": "pending"}),
+    }
+
+
+# ---------------- facility (repair) requests ----------------
+class RepairCreate(BaseModel):
+    category: str
+    title: str = Field(..., min_length=3, max_length=120)
+    description: str = Field(..., min_length=5, max_length=2000)
+    location: Optional[str] = Field(None, max_length=120)
+    visibility: str = "estate"
+    images: Optional[List[str]] = Field(None, max_length=3)
+
+    @field_validator("category")
+    @classmethod
+    def _c(cls, v):
+        if v not in REQUEST_CATEGORIES:
+            raise ValueError("Unknown category")
+        return v
+
+    @field_validator("visibility")
+    @classmethod
+    def _v(cls, v):
+        if v not in ("estate", "management"):
+            raise ValueError("Visibility must be estate or management")
+        return v
+
+    @field_validator("images")
+    @classmethod
+    def _i(cls, v):
+        if v and sum(len(i) for i in v) > 4 * 1024 * 1024:
+            raise ValueError("Photos are too large")
+        return v
+
+
+class RepairUpdate(BaseModel):
+    status: Optional[str] = None
+    assigned_to: Optional[str] = Field(None, max_length=100)
+    note: Optional[str] = Field(None, max_length=500)
+
+    @field_validator("status")
+    @classmethod
+    def _s(cls, v):
+        if v is not None and v not in REQUEST_STATUSES:
+            raise ValueError("Unknown status")
+        return v
+
+
+def _repair_out(r: Dict, me: Dict) -> Dict:
+    d = serialize_doc({k: v for k, v in r.items() if k != "me_too"})
+    d["me_too_count"] = len(r.get("me_too") or [])
+    d["me_too_mine"] = me["_id"] in (r.get("me_too") or [])
+    d["mine"] = r.get("reporter_id") == me["_id"]
+    spent = list(expenses_collection.find({"request_id": r["_id"], "status": "approved"}, {"amount": 1}))
+    d["cost"] = sum(int(e["amount"]) for e in spent) if spent else None
+    return d
+
+
+@app.post("/api/repairs")
+async def create_repair(body: RepairCreate, background_tasks: BackgroundTasks, current_user: Dict = Depends(get_current_user)):
+    estate_id = _estate_oid(current_user)
+    doc = {**body.dict(), "image_count": len(body.images or []), "estate_id": estate_id, "status": "reported", "reporter_id": current_user["_id"],
+           "reporter_name": current_user.get("name"), "reporter_unit": current_user.get("apartment"),
+           "me_too": [], "updates": [], "created_at": datetime.utcnow()}
+    res = requests_collection.insert_one(doc)
+    doc["_id"] = res.inserted_id
+    admins = [a["email"] for a in users_collection.find({"estate_id": estate_id, "role": "admin", "is_active": True}, {"email": 1}) if a.get("email")]
+    background_tasks.add_task(notify_by_email, admins, f"New repair request: {body.title}", branded_email(
+        "New repair request",
+        f"<p><strong>{html.escape(body.title)}</strong> ({html.escape(body.category.replace('_', ' '))})"
+        f"{' at ' + html.escape(body.location) if body.location else ''}</p><p>{html.escape(body.description)}</p>"
+        f"<p>Reported by {html.escape(current_user.get('name') or 'a resident')}.</p>"))
+    return _repair_out(doc, current_user)
+
+
+@app.get("/api/repairs")
+async def list_repairs(status: Optional[str] = None, current_user: Dict = Depends(get_current_user)):
+    estate_id = _estate_oid(current_user)
+    q: Dict = {"estate_id": estate_id}
+    if not _is_admin(current_user) and current_user.get("role") != "guard":
+        q["$or"] = [{"visibility": "estate"}, {"reporter_id": current_user["_id"]}]
+    if status == "open":
+        q["status"] = {"$in": ["reported", "assigned", "in_progress"]}
+    elif status:
+        q["status"] = status
+    return [_repair_out(r, current_user) for r in requests_collection.find(q, {"images": 0}).sort("created_at", -1).limit(200)]
+
+
+@app.get("/api/repairs/{repair_id}")
+async def get_repair(repair_id: str, current_user: Dict = Depends(get_current_user)):
+    r = requests_collection.find_one({"_id": _oid(repair_id, "request"), "estate_id": _estate_oid(current_user)})
+    if not r or (r.get("visibility") == "management" and not _is_admin(current_user) and current_user.get("role") != "guard" and r.get("reporter_id") != current_user["_id"]):
+        raise HTTPException(status_code=404, detail="Request not found")
+    return _repair_out(r, current_user)
+
+
+@app.post("/api/repairs/{repair_id}/me-too")
+async def repair_me_too(repair_id: str, current_user: Dict = Depends(get_current_user)):
+    r = requests_collection.find_one({"_id": _oid(repair_id, "request"), "estate_id": _estate_oid(current_user), "visibility": "estate"})
+    if not r:
+        raise HTTPException(status_code=404, detail="Request not found")
+    if current_user["_id"] in (r.get("me_too") or []):
+        requests_collection.update_one({"_id": r["_id"]}, {"$pull": {"me_too": current_user["_id"]}})
+    else:
+        requests_collection.update_one({"_id": r["_id"]}, {"$addToSet": {"me_too": current_user["_id"]}})
+    return _repair_out(requests_collection.find_one({"_id": r["_id"]}, {"images": 0}), current_user)
+
+
+@app.patch("/api/repairs/{repair_id}")
+async def update_repair(repair_id: str, body: RepairUpdate, background_tasks: BackgroundTasks, current_user: Dict = Depends(require_admin)):
+    r = requests_collection.find_one({"_id": _oid(repair_id, "request"), "estate_id": _estate_oid(current_user)})
+    if not r:
+        raise HTTPException(status_code=404, detail="Request not found")
+    changes: Dict = {}
+    if body.status:
+        changes["status"] = body.status
+        if body.status in ("fixed", "closed"):
+            changes["fixed_at"] = datetime.utcnow()
+    if body.assigned_to is not None:
+        changes["assigned_to"] = body.assigned_to.strip() or None
+    update = {"$set": changes} if changes else {}
+    if body.note or body.status:
+        update["$push"] = {"updates": {"by": current_user.get("name"), "status": body.status, "note": body.note, "at": datetime.utcnow()}}
+    if not update:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+    requests_collection.update_one({"_id": r["_id"]}, update)
+    if body.status in ("fixed", "closed"):
+        people = [r.get("reporter_id")] + list(r.get("me_too") or [])
+        emails = [u["email"] for u in users_collection.find({"_id": {"$in": [p for p in people if p]}}, {"email": 1}) if u.get("email")]
+        background_tasks.add_task(notify_by_email, emails, f"Fixed: {r['title']}", branded_email(
+            "A repair you reported was fixed",
+            f"<p><strong>{html.escape(r['title'])}</strong> is marked as {body.status}.</p>"
+            f"{'<p>' + html.escape(body.note) + '</p>' if body.note else ''}"))
+    return _repair_out(requests_collection.find_one({"_id": r["_id"]}, {"images": 0}), current_user)
+
+
+@app.get("/api/repairs/{repair_id}/images")
+async def get_repair_images(repair_id: str, current_user: Dict = Depends(get_current_user)):
+    r = requests_collection.find_one({"_id": _oid(repair_id, "request"), "estate_id": _estate_oid(current_user)}, {"images": 1, "visibility": 1, "reporter_id": 1})
+    if not r or (r.get("visibility") == "management" and not _is_admin(current_user) and current_user.get("role") != "guard" and r.get("reporter_id") != current_user["_id"]):
+        raise HTTPException(status_code=404, detail="Request not found")
+    return {"images": r.get("images") or []}
 
 
 app.mount("/", socketio.ASGIApp(sio, socketio_path="socket.io"))
