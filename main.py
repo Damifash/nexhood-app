@@ -1,4 +1,4 @@
-# NEXHOOD BACKEND BUILD MARKER: v26-2026-10-11-waitlist
+# NEXHOOD BACKEND BUILD MARKER: v28-2026-10-12-analytics
 # If /health below doesn't return this exact build string, the running
 # process is NOT this file — kill whatever's on port 8000 and restart.
 from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Request, UploadFile, File, Body, BackgroundTasks
@@ -83,7 +83,17 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
-app = FastAPI(title="NexHood Backend", description="Backend for estate security management")
+# The interactive API docs (/docs, /redoc, /openapi.json) are hidden in
+# production — they were publicly listing every endpoint. Set ENABLE_DOCS=1
+# locally if you want them back while developing.
+_docs_on = os.getenv("ENABLE_DOCS") == "1"
+app = FastAPI(
+    title="NexHood Backend",
+    description="Backend for estate security management",
+    docs_url="/docs" if _docs_on else None,
+    redoc_url="/redoc" if _docs_on else None,
+    openapi_url="/openapi.json" if _docs_on else None,
+)
 
 # Initialize Socket.IO
 # This was set to an empty list, which blocks every origin — real-time
@@ -345,6 +355,9 @@ login_rate_limit = defaultdict(list)
 reset_rate_limit = defaultdict(list)
 contact_rate_limit = defaultdict(list)
 waitlist_rate_limit = defaultdict(list)
+register_rate_limit = defaultdict(list)
+police_rate_limit = defaultdict(list)
+TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "30"))
 
 
 # ---------------------------------------------------------------------------
@@ -437,10 +450,17 @@ class VisitorPassValidate(BaseModel):
 class IncidentCreate(BaseModel):
     type: str = Field(..., pattern="^(emergency|theft|vandalism|dispute|suspicious_activity|maintenance|other)$")
     severity: str = Field("medium", pattern="^(low|medium|high|critical)$")
-    title: str = Field(..., min_length=3)
-    description: str = Field(..., min_length=10)
+    title: str = Field(..., min_length=3, max_length=150)
+    description: str = Field(..., min_length=10, max_length=5000)
     location: Optional[Dict] = None
-    images: Optional[List[str]] = None
+    images: Optional[List[str]] = Field(None, max_length=4)
+
+    @field_validator("images")
+    @classmethod
+    def _cap_images(cls, v):
+        if v and sum(len(i) for i in v) > 6 * 1024 * 1024:
+            raise ValueError("Photos are too large (max about 4MB in total)")
+        return v
 
 
 class UserInvite(BaseModel):
@@ -497,12 +517,21 @@ class PoliceIntegration(BaseModel):
 
 
 class PostCreate(BaseModel):
-    content: str = Field(..., min_length=1)
+    content: str = Field(..., min_length=1, max_length=5000)
     type: str = Field(..., pattern="^(event|appreciation|general)$")
     # Data URIs (e.g. "data:image/jpeg;base64,...") from /api/upload/image —
     # kept small in practice by the frontend's client-side size cap, since
     # these get embedded directly in the Mongo document, not object storage.
-    images: Optional[List[str]] = None
+    images: Optional[List[str]] = Field(None, max_length=4)
+
+    @field_validator("images")
+    @classmethod
+    def _cap_images(cls, v):
+        # Images are stored inside the database document itself, and the
+        # free database is 512MB for every estate combined. Cap total size.
+        if v and sum(len(i) for i in v) > 6 * 1024 * 1024:
+            raise ValueError("Images are too large (max about 4MB in total)")
+        return v
 
 
 class DonationCreate(BaseModel):
@@ -752,7 +781,7 @@ async def location_update(sid, data):
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-BUILD_VERSION = "v26-2026-10-11-waitlist"
+BUILD_VERSION = "v28-2026-10-12-analytics"
 
 
 @app.get("/health")
@@ -774,6 +803,17 @@ async def register(user: UserCreate):
     endpoints below."""
     if user.role != "resident":
         raise HTTPException(status_code=400, detail="Only residents can register publicly.")
+
+    # Each registration creates a brand-new estate, so without a limit a
+    # script could flood the database with junk estates.
+    now = datetime.utcnow()
+    reg_key = normalize_email(user.email)
+    register_rate_limit[reg_key] = [t for t in register_rate_limit[reg_key] if (now - t).total_seconds() < 3600]
+    register_rate_limit["__global__"] = [t for t in register_rate_limit["__global__"] if (now - t).total_seconds() < 3600]
+    if len(register_rate_limit[reg_key]) >= 3 or len(register_rate_limit["__global__"]) >= 30:
+        raise HTTPException(status_code=429, detail="Too many sign-ups right now. Please try again later.")
+    register_rate_limit[reg_key].append(now)
+    register_rate_limit["__global__"].append(now)
 
     if users_collection.find_one(email_query(user.email)):
         raise HTTPException(status_code=400, detail="User already exists")
@@ -804,15 +844,24 @@ async def register(user: UserCreate):
     estate_doc = {
         "name": estate_name,
         "address": f"{estate_name}, Nigeria",
-        "created_at": datetime.utcnow()
+        "created_at": datetime.utcnow(),
+        # Billing groundwork: every new estate starts on a 30-day trial.
+        # Nothing is blocked when it ends yet — this just records the dates
+        # so billing can be switched on later without migrating old estates.
+        "subscription": {
+            "plan": "trial",
+            "status": "trialing",
+            "trial_ends_at": datetime.utcnow() + timedelta(days=TRIAL_DAYS),
+        },
     }
     estate_result = estates_collection.insert_one(estate_doc)
     estate_id = estate_result.inserted_id
 
     hashed_password = get_password_hash(user.password)
 
-    user_dict = user.dict(exclude_unset=True)
+    user_dict = user.dict(exclude_unset=True, exclude={"badges"})
     user_dict.update({
+        "badges": [],
         "email": normalize_email(user.email),
         "password": hashed_password,
         "estate_id": estate_id,
@@ -857,7 +906,7 @@ async def register(user: UserCreate):
         f"Welcome to NexHood, {user.name.split(' ')[0]}!",
         branded_email(
             f"Welcome to {estate_name}",
-            f"<p>Hi {user.name},</p>"
+            f"<p>Hi {html.escape(user.name)},</p>"
             f"<p>Your NexHood account is ready. "
             + (
                 f"Since you're the first person to register {estate_name}, you're now this estate's admin — "
@@ -1025,9 +1074,9 @@ async def submit_contact(msg: ContactMessageCreate):
         f"New Nexhood contact form message from {msg.name}",
         branded_email(
             "New contact form submission",
-            f"<p><strong>From:</strong> {msg.name} ({msg.email})</p>"
+            f"<p><strong>From:</strong> {html.escape(msg.name)} ({html.escape(msg.email)})</p>"
             f"<p><strong>Message:</strong></p>"
-            f"<p style='white-space:pre-wrap;'>{msg.message}</p>"
+            f"<p style='white-space:pre-wrap;'>{html.escape(msg.message)}</p>"
         )
     )
     send_email(
@@ -1035,9 +1084,9 @@ async def submit_contact(msg: ContactMessageCreate):
         "We got your message — Nexhood",
         branded_email(
             "Thanks for reaching out",
-            f"<p>Hi {msg.name},</p>"
+            f"<p>Hi {html.escape(msg.name)},</p>"
             f"<p>Thanks for reaching out to Nexhood — we've received your message and will get back to you soon.</p>"
-            f"<p style='color:#9ca3af;font-size:12px;border-left:2px solid #e5e7eb;padding-left:10px;'>{msg.message}</p>"
+            f"<p style='color:#9ca3af;font-size:12px;border-left:2px solid #e5e7eb;padding-left:10px;'>{html.escape(msg.message)}</p>"
         )
     )
 
@@ -1290,6 +1339,23 @@ async def create_visitor_pass(pass_data: VisitorPassCreate, current_user: Dict =
         raise HTTPException(status_code=403, detail="Unauthorized")
     if not current_user.get("estate_id"):
         raise HTTPException(status_code=400, detail="User must be associated with an estate")
+    # A pass with no sensible end date is effectively a permanent key to the
+    # estate. Enforce the estate's maxVisitorDuration (hours, default 24).
+    def _utc_naive(d: datetime) -> datetime:
+        return (d - d.utcoffset()).replace(tzinfo=None) if d.tzinfo else d
+    vf, vu = _utc_naive(pass_data.valid_from), _utc_naive(pass_data.valid_until)
+    if vu <= vf:
+        raise HTTPException(status_code=400, detail="The pass must end after it starts")
+    estate_for_pass = estates_collection.find_one({"_id": ObjectId(current_user["estate_id"])}, {"settings": 1})
+    try:
+        max_hours = float(((estate_for_pass or {}).get("settings") or {}).get("maxVisitorDuration") or 24)
+    except (TypeError, ValueError):
+        max_hours = 24
+    max_hours = min(max(max_hours, 1), 24 * 7)  # never more than 7 days
+    if (vu - vf) > timedelta(hours=max_hours):
+        raise HTTPException(status_code=400, detail=f"A visitor pass can last at most {int(max_hours)} hours")
+    if vf > datetime.utcnow() + timedelta(days=30):
+        raise HTTPException(status_code=400, detail="Passes can only be created up to 30 days ahead")
     # Lazy janitor: strip stored QR images from this estate's passes that expired
     # over 7 days ago. Pass records (names, times, gates) are kept forever for
     # history/analytics — only the heavy QR image is removed. Keeps the free
@@ -1341,7 +1407,7 @@ async def create_visitor_pass(pass_data: VisitorPassCreate, current_user: Dict =
             f"Your NexHood visitor pass — {pass_dict['visitor_name']}",
             branded_email(
                 "You've been issued a visitor pass",
-                f"<p>Hi {pass_dict['visitor_name']},</p>"
+                f"<p>Hi {html.escape(pass_dict['visitor_name'])},</p>"
                 f"<p>Your entry code is:</p>"
                 f"<p style='font-size:26px;font-weight:bold;letter-spacing:3px;color:#1e2a5e;'>{code}</p>"
                 f"<p>Valid from {pass_data.valid_from} to {pass_data.valid_until}.</p>"
@@ -1365,9 +1431,16 @@ async def validate_visitor_pass(code: str, pass_data: VisitorPassValidate, curre
     if current_user["role"] not in ["guard", "admin"]:
         raise HTTPException(status_code=403, detail="Unauthorized")
 
-    pass_data_db = passes_collection.find_one({"code": code})
-    if not pass_data_db or str(pass_data_db["estate_id"]) != str(current_user["estate_id"]):
-        logger.error(f"Validation failed for code {code}: pass_data_db={pass_data_db}, user_estate_id={current_user['estate_id']}")
+    # Codes are only 4 characters and are reused once a pass is used or
+    # expired, and different estates can hold the same code. Looking up by
+    # code alone could pick another estate's pass (-> "Invalid visitor code")
+    # or an old used pass (-> "Pass already used") for a perfectly valid
+    # visitor. Always search this estate only, preferring the active pass.
+    code = (code or "").strip().upper()
+    estate_oid = ObjectId(current_user["estate_id"])
+    pass_data_db = passes_collection.find_one({"code": code, "estate_id": estate_oid, "status": "active"}) \
+        or passes_collection.find_one({"code": code, "estate_id": estate_oid}, sort=[("created_at", -1)])
+    if not pass_data_db:
         raise HTTPException(status_code=404, detail="Invalid visitor code")
 
     now = datetime.utcnow()
@@ -1447,9 +1520,9 @@ async def create_incident(incident: IncidentCreate, background_tasks: Background
             f"NexHood ALERT: {incident.severity.upper()} incident reported",
             branded_email(
                 f"{incident.severity.capitalize()} incident reported",
-                f"<p><strong>{incident.title}</strong></p>"
-                f"<p>{incident.description}</p>"
-                f"<p>Reported by {current_user['name']}. Check the app for full details.</p>"
+                f"<p><strong>{html.escape(incident.title)}</strong></p>"
+                f"<p>{html.escape(incident.description)}</p>"
+                f"<p>Reported by {html.escape(current_user['name'])}. Check the app for full details.</p>"
                 f"<p style='margin:20px 0;'><a href=\"{LOGIN_URL}\" style=\"background:#1e2a5e;color:#ffffff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:600;display:inline-block;\">Open NexHood</a></p>"
             )
         )
@@ -1628,8 +1701,8 @@ async def create_alert(alert: AlertCreate, background_tasks: BackgroundTasks, cu
                     f"{alert_dict['priority'].capitalize()} priority alert",
                     f"<p>A {alert_dict['priority']} priority alert was raised at <strong>{(estate or {}).get('name', 'your estate')}</strong>.</p>"
                     f"<p><strong>{alert.type.replace('_', ' ').title()}</strong></p>"
-                    f"<p>{alert.message or 'No details provided'}</p>"
-                    f"<p>Raised by {current_user.get('name', 'a resident')}"
+                    f"<p>{html.escape(alert.message or 'No details provided')}</p>"
+                    f"<p>Raised by {html.escape(current_user.get('name', 'a resident'))}"
                     f"{' — ' + current_user.get('phone') if current_user.get('phone') else ''}.</p>"
                     f"<p style='margin:20px 0;'><a href=\"{LOGIN_URL}\" style=\"background:#1e2a5e;color:#ffffff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:600;display:inline-block;\">Open NexHood</a></p>"
                 )
@@ -1756,6 +1829,17 @@ async def police_integration(data: PoliceIntegration, current_user: Dict = Depen
     alert = alerts_collection.find_one({"_id": ObjectId(data.alert_id)})
     if not alert or str(alert["estate_id"]) != str(current_user.get("estate_id")):
         raise HTTPException(status_code=404, detail="Alert not found")
+    # One police notification per alert per 10 minutes, and at most 5 per
+    # user per hour — otherwise one tap-happy (or malicious) account could
+    # flood the police inbox and get the estate's emails ignored.
+    if alert.get("police_notified_at") and (datetime.utcnow() - alert["police_notified_at"]).total_seconds() < 600:
+        return {"message": "Police were already notified about this alert a few minutes ago.", "status": "notified", "recipients": 0}
+    uid = str(current_user["_id"])
+    now_ts = datetime.utcnow()
+    police_rate_limit[uid] = [t for t in police_rate_limit[uid] if (now_ts - t).total_seconds() < 3600]
+    if len(police_rate_limit[uid]) >= 5:
+        raise HTTPException(status_code=429, detail="Too many police notifications. Call the police directly if this is an emergency.")
+    police_rate_limit[uid].append(now_ts)
 
     estate = estates_collection.find_one({"_id": ObjectId(current_user["estate_id"])})
     police_email = ((estate or {}).get("settings") or {}).get("police_email") or POLICE_EMAIL
@@ -1772,8 +1856,8 @@ async def police_integration(data: PoliceIntegration, current_user: Dict = Depen
         "Emergency — action needed",
         f"<p><strong>Estate:</strong> {estate.get('name') if estate else 'Unknown'}</p>"
         f"<p><strong>Type:</strong> {alert.get('type', '').replace('_', ' ').title()}</p>"
-        f"<p><strong>Message:</strong> {alert.get('message', 'No details provided')}</p>"
-        f"<p><strong>Reported by:</strong> {current_user.get('name', 'A resident')} ({current_user.get('phone', 'no phone on file')})</p>"
+        f"<p><strong>Message:</strong> {html.escape(alert.get('message') or 'No details provided')}</p>"
+        f"<p><strong>Reported by:</strong> {html.escape(current_user.get('name', 'A resident'))} ({current_user.get('phone', 'no phone on file')})</p>"
         f"<p>This alert was flagged for police attention via NexHood — please respond as appropriate.</p>"
     )
 
@@ -1846,6 +1930,9 @@ async def update_user(user_id: str, role: Optional[str] = None, is_active: Optio
     if role:
         if role not in ASSIGNABLE_ROLES:
             raise HTTPException(status_code=400, detail=f"Invalid role. Must be one of: {sorted(ASSIGNABLE_ROLES)}")
+        if role == "admin" and user.get("role") != "admin":
+            if users_collection.count_documents({"estate_id": user.get("estate_id"), "role": "admin"}) >= 3:
+                raise HTTPException(status_code=400, detail="Maximum 3 admins allowed per estate")
         update_data["role"] = role
     if is_active is not None:
         update_data["is_active"] = is_active
@@ -1980,7 +2067,7 @@ async def single_invite(invite: UserInvite, current_user: Dict = Depends(require
         f"You've been invited to {estate_name}",
         branded_email(
             "You've been invited",
-            f"<p>Hi {invite.name},</p>"
+            f"<p>Hi {html.escape(invite.name)},</p>"
             f"<p>You've been added to <strong>{estate_name}</strong> on NexHood as a <strong>{invite.role}</strong>.</p>"
             f"<p>Login email: {invite_email}<br>Temporary password: <strong>{temp_password}</strong></p>"
             f"<p style=\"margin:24px 0;\"><a href=\"{LOGIN_URL}\" "
@@ -2036,6 +2123,14 @@ async def bulk_invite_users(file: UploadFile = File(...), current_user: Dict = D
             continue
         name, email, phone, role, apartment = [field.strip() for field in row[:5]] + [None] * (5 - len(row))
         email = normalize_email(email)
+        role = (role or "resident").lower()
+        # SECURITY: this used to accept ANY role string from the CSV —
+        # including "super_admin" — so any estate admin (and anyone can
+        # become one by registering a new estate) could mint a platform-wide
+        # super_admin account. Same allowlist as the single-invite route.
+        if role not in ASSIGNABLE_ROLES:
+            results.append({"email": email, "status": "skipped", "reason": f"Invalid role '{role}'"})
+            continue
         try:
             if users_collection.find_one(email_query(email)):
                 results.append({"email": email, "status": "skipped", "reason": "User already exists"})
@@ -2076,7 +2171,7 @@ async def bulk_invite_users(file: UploadFile = File(...), current_user: Dict = D
                 f"You've been invited to {estate_name}",
                 branded_email(
                     "You've been invited",
-                    f"<p>Hi {name},</p>"
+                    f"<p>Hi {html.escape(name or '')},</p>"
                     f"<p>You've been added to <strong>{estate_name}</strong> on NexHood as a <strong>{role or 'resident'}</strong>.</p>"
                     f"<p>Login email: {email}<br>Temporary password: <strong>{temp_password}</strong></p>"
                     f"<p style=\"margin:24px 0;\"><a href=\"{LOGIN_URL}\" "
@@ -2100,117 +2195,329 @@ async def bulk_invite_users(file: UploadFile = File(...), current_user: Dict = D
     return {"message": "Bulk invite completed", "results": results}
 
 
+# ---------------------------------------------------------------------------
+# Admin analytics
+# ---------------------------------------------------------------------------
+# Domains that are obviously not a real police inbox (test/placeholder
+# values typed during setup). Used only to flag "check your police contact".
+PLACEHOLDER_EMAIL_DOMAINS = {"example.com", "test.com", "ayy.com", "email.com", "mail.com", "abc.com", "xyz.com"}
+ANALYTICS_PERIODS = {7, 30, 90, 365}
+
+
+def _median(values):
+    vals = sorted(v for v in values if v is not None)
+    if not vals:
+        return None
+    mid = len(vals) // 2
+    return vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2
+
+
+def _pct_change(cur, prev):
+    if not prev:
+        return None
+    return round((cur - prev) / prev * 100)
+
+
+def build_admin_analytics(estate_filter: Dict, days: int, estate: Optional[Dict]) -> Dict:
+    """Everything the admin Dashboard and Analytics pages show, for the last
+    `days` days, compared with the `days` before that. Estates are small
+    (hundreds of records a month), so most of this is plain Python over a
+    period's documents rather than heavy aggregation pipelines."""
+    now = datetime.utcnow()
+    start = now - timedelta(days=days)
+    prev_start = start - timedelta(days=days)
+
+    # Lazy janitor: a pass whose time is up but was never scanned used to
+    # stay "active" forever, which made pass stats meaningless.
+    try:
+        passes_collection.update_many(
+            {**estate_filter, "status": "active", "valid_until": {"$lt": now}},
+            {"$set": {"status": "expired"}}
+        )
+    except Exception as e:
+        logger.warning(f"Pass expiry sweep skipped: {e}")
+
+    in_period = {"created_at": {"$gte": start}}
+    in_prev = {"created_at": {"$gte": prev_start, "$lt": start}}
+
+    # --- raw period data (projection keeps photos/QR images out) ---
+    passes = list(passes_collection.find({**estate_filter, **in_period}, {"created_at": 1, "status": 1, "used_at": 1, "valid_from": 1}))
+    incidents = list(incidents_collection.find({**estate_filter, **in_period}, {"created_at": 1, "status": 1, "type": 1, "severity": 1, "resolved_at": 1}))
+    alerts = list(alerts_collection.find({**estate_filter, **in_period}, {"created_at": 1, "status": 1, "type": 1, "acknowledged_by": 1, "resolved_at": 1, "police_status": 1}))
+
+    visitors_prev = passes_collection.count_documents({**estate_filter, **in_prev})
+    incidents_prev = incidents_collection.count_documents({**estate_filter, **in_prev})
+    alerts_prev = alerts_collection.count_documents({**estate_filter, **in_prev})
+
+    # --- daily trend (every day present, zeros included) ---
+    day_keys = [(start + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days + 1)]
+    daily = {k: {"date": k, "visitors": 0, "incidents": 0, "alerts": 0} for k in day_keys}
+    for coll, key in ((passes, "visitors"), (incidents, "incidents"), (alerts, "alerts")):
+        for d in coll:
+            k = d["created_at"].strftime("%Y-%m-%d")
+            if k in daily:
+                daily[k][key] += 1
+
+    # --- visitor patterns (Nigeria is UTC+1, so shift hours for display) ---
+    by_hour = [0] * 24
+    by_weekday = [0] * 7  # Monday = 0
+    for p in passes:
+        t = p.get("used_at") or p.get("valid_from") or p["created_at"]
+        local = t + timedelta(hours=1)
+        by_hour[local.hour] += 1
+        by_weekday[local.weekday()] += 1
+    pass_status = {"used": 0, "active": 0, "expired": 0}
+    for p in passes:
+        pass_status[p.get("status", "active")] = pass_status.get(p.get("status", "active"), 0) + 1
+
+    # --- response times ---
+    ack_minutes, alert_resolve_minutes = [], []
+    acknowledged = 0
+    for a in alerts:
+        acks = [x.get("timestamp") for x in (a.get("acknowledged_by") or []) if x.get("timestamp")]
+        if acks:
+            acknowledged += 1
+            ack_minutes.append((min(acks) - a["created_at"]).total_seconds() / 60)
+        if a.get("resolved_at"):
+            alert_resolve_minutes.append((a["resolved_at"] - a["created_at"]).total_seconds() / 60)
+    incident_resolve_hours = [
+        (i["resolved_at"] - i["created_at"]).total_seconds() / 3600
+        for i in incidents if i.get("resolved_at")
+    ]
+
+    def _count_by(items, field):
+        out = {}
+        for it in items:
+            k = it.get(field) or "unknown"
+            out[k] = out.get(k, 0) + 1
+        return [{"id": k, "count": v} for k, v in sorted(out.items(), key=lambda x: -x[1])]
+
+    # --- people ---
+    users = list(users_collection.find({**estate_filter, "is_active": True}, {"name": 1, "role": 1, "last_seen": 1, "created_at": 1, "apartment": 1}))
+    role_counts = {}
+    for u in users:
+        role_counts[u.get("role", "resident")] = role_counts.get(u.get("role", "resident"), 0) + 1
+    logged_in_ids = set(login_logs_collection.distinct("user_id", {**estate_filter}))
+    # login_logs only exist since login logging was added, so also treat
+    # any activity well after the account was created as "has logged in".
+    def _has_used_app(u):
+        if u["_id"] in logged_in_ids:
+            return True
+        ls, ca = u.get("last_seen"), u.get("created_at")
+        return bool(ls and ca and (ls - ca).total_seconds() > 300)
+    never_logged_in = [u for u in users if u.get("role") != "admin" and not _has_used_app(u)]
+    active_7d = sum(1 for u in users if u.get("last_seen") and u["last_seen"] >= now - timedelta(days=7))
+    active_period = sum(1 for u in users if u.get("last_seen") and u["last_seen"] >= start)
+    residents = [u for u in users if u.get("role") == "resident"]
+    residents_dormant = sum(1 for u in residents if not u.get("last_seen") or u["last_seen"] < now - timedelta(days=30))
+    residents_no_unit = sum(1 for u in residents if not (u.get("apartment") or "").strip())
+    logins_period = login_logs_collection.count_documents({**estate_filter, "timestamp": {"$gte": start}})
+
+    # --- open items (not limited to the period: these need action now) ---
+    open_alerts = list(alerts_collection.find({**estate_filter, "status": {"$in": ["active", "acknowledged"]}}, {"created_at": 1, "type": 1, "status": 1}).sort("created_at", 1))
+    open_incidents = list(incidents_collection.find({**estate_filter, "status": {"$nin": ["resolved", "closed"]}}, {"created_at": 1, "title": 1, "severity": 1}).sort("created_at", 1))
+    pending_donations = donations_collection.count_documents({**estate_filter, "status": "pending"})
+
+    # --- needs attention ---
+    attention = []
+    stale_alerts = [a for a in open_alerts if a["created_at"] < now - timedelta(hours=1)]
+    if stale_alerts:
+        oldest_days = (now - stale_alerts[0]["created_at"]).days
+        attention.append({
+            "key": "stale_alerts", "level": "critical",
+            "title": f"{len(stale_alerts)} alert{'s' if len(stale_alerts) != 1 else ''} still open",
+            "detail": f"The oldest has been open {oldest_days} day{'s' if oldest_days != 1 else ''}. Resolve them so real emergencies stand out.",
+            "link": "/app/alerts",
+        })
+    stale_incidents = [i for i in open_incidents if i["created_at"] < now - timedelta(hours=48)]
+    if stale_incidents:
+        attention.append({
+            "key": "stale_incidents", "level": "warning",
+            "title": f"{len(stale_incidents)} incident{'s' if len(stale_incidents) != 1 else ''} open for over 2 days",
+            "detail": "Update or resolve them so residents can see they were handled.",
+            "link": "/app/incidents",
+        })
+    if estate is not None:
+        settings = (estate or {}).get("settings") or {}
+        if role_counts.get("guard", 0) == 0:
+            attention.append({
+                "key": "no_guards", "level": "critical",
+                "title": "No guards on NexHood yet",
+                "detail": "Panic alerts and gate passes need guards to respond. Invite your gate guards.",
+                "link": "/app/users",
+            })
+        police_email = (settings.get("police_email") or "").strip().lower()
+        police_phone = (settings.get("police_phone") or "").strip()
+        if not police_email and not police_phone and role_counts.get("police", 0) == 0:
+            attention.append({
+                "key": "no_police", "level": "critical",
+                "title": "No police contact set",
+                "detail": "\"Notify police\" has nowhere to go. Add your local division's number and email.",
+                "link": "/app/settings",
+            })
+        elif police_email and police_email.split("@")[-1] in PLACEHOLDER_EMAIL_DOMAINS:
+            attention.append({
+                "key": "placeholder_police", "level": "warning",
+                "title": "Police email looks like a placeholder",
+                "detail": f"{police_email} doesn't look like a real inbox. Replace it with your division's email.",
+                "link": "/app/settings",
+            })
+        if not settings.get("emergencyContacts"):
+            attention.append({
+                "key": "no_emergency_contacts", "level": "info",
+                "title": "No emergency contacts",
+                "detail": "Add the estate chairman, facility manager or a nearby clinic so residents can reach them in one tap.",
+                "link": "/app/settings",
+            })
+    if residents and residents_dormant == len(residents):
+        attention.append({
+            "key": "dormant_residents", "level": "warning",
+            "title": "No resident has opened NexHood in 30+ days",
+            "detail": "Share the app in your estate WhatsApp group, or post an event to bring people back.",
+            "link": "/app/community",
+        })
+    elif residents_dormant:
+        attention.append({
+            "key": "dormant_residents", "level": "info",
+            "title": f"{residents_dormant} of {len(residents)} residents inactive for 30+ days",
+            "detail": "A quick reminder in your estate WhatsApp group helps.",
+            "link": "/app/users",
+        })
+    if never_logged_in:
+        attention.append({
+            "key": "never_logged_in", "level": "info",
+            "title": f"{len(never_logged_in)} invited user{'s' if len(never_logged_in) != 1 else ''} never logged in",
+            "detail": "They may not have seen the invite email (check spam). Confirm their email on the Users page, or send them the login link on WhatsApp.",
+            "link": "/app/users",
+        })
+    if pending_donations:
+        attention.append({
+            "key": "pending_donations", "level": "info",
+            "title": f"{pending_donations} welfare pledge{'s' if pending_donations != 1 else ''} to confirm",
+            "detail": "Confirm the ones you've received so the campaign totals are right.",
+            "link": "/app/welfare",
+        })
+    if residents_no_unit:
+        attention.append({
+            "key": "residents_no_unit", "level": "info",
+            "title": f"{residents_no_unit} resident{'s' if residents_no_unit != 1 else ''} without a house/flat number",
+            "detail": "Ask them to add it under Settings > Profile. You'll need it for bills and service charge.",
+            "link": "/app/users",
+        })
+    level_rank = {"critical": 0, "warning": 1, "info": 2}
+    attention.sort(key=lambda x: level_rank[x["level"]])
+
+    # --- setup checklist (estate admins only) ---
+    setup = []
+    if estate is not None:
+        settings = (estate or {}).get("settings") or {}
+        police_email = (settings.get("police_email") or "").strip().lower()
+        setup = [
+            {"key": "residents", "label": "Invite at least 5 residents", "done": len(residents) >= 5},
+            {"key": "guards", "label": "Invite your gate guards", "done": role_counts.get("guard", 0) > 0},
+            {"key": "police", "label": "Add a real police contact", "done": bool(settings.get("police_phone") or police_email) and police_email.split("@")[-1] not in PLACEHOLDER_EMAIL_DOMAINS},
+            {"key": "emergency", "label": "Add emergency contacts", "done": bool(settings.get("emergencyContacts"))},
+            {"key": "units", "label": "Every resident has a house/flat number", "done": bool(residents) and residents_no_unit == 0},
+            {"key": "first_pass", "label": "First visitor pass scanned at the gate", "done": passes_collection.count_documents({**estate_filter, "status": "used"}) > 0},
+        ]
+
+    # --- recent activity with names ---
+    logs = list(audit_logs_collection.find({**estate_filter, "timestamp": {"$gte": start}}, {"user_id": 1, "action": 1, "entity": 1, "timestamp": 1}).sort("timestamp", -1).limit(25))
+    actor_ids = list({l.get("user_id") for l in logs if l.get("user_id")})
+    actors = {u["_id"]: u for u in users_collection.find({"_id": {"$in": actor_ids}}, {"name": 1, "role": 1})}
+    recent_activity = [{
+        "actor": (actors.get(l.get("user_id")) or {}).get("name") or "Someone",
+        "role": (actors.get(l.get("user_id")) or {}).get("role"),
+        "action": l.get("action"),
+        "entity": l.get("entity"),
+        "at": l.get("timestamp"),
+    } for l in logs]
+
+    welfare_raised_agg = list(donations_collection.aggregate([
+        {"$match": {**estate_filter, "status": "verified"}},
+        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
+    ]))
+
+    open_alert_count = len(open_alerts)
+    return {
+        "period": {"days": days, "start": start, "end": now},
+        "summary": {
+            # names kept from the old response so nothing else breaks
+            "total_visitors": len(passes),
+            "active_incidents": len(open_incidents),
+            "total_alerts": len(alerts),
+            "active_alerts": open_alert_count,
+            "total_users": len(users),
+            # new
+            "visitors_prev": visitors_prev,
+            "visitors_change_pct": _pct_change(len(passes), visitors_prev),
+            "incidents_new": len(incidents),
+            "incidents_prev": incidents_prev,
+            "incidents_change_pct": _pct_change(len(incidents), incidents_prev),
+            "alerts_prev": alerts_prev,
+            "alerts_change_pct": _pct_change(len(alerts), alerts_prev),
+            "users_active_7d": active_7d,
+            "users_active_period": active_period,
+            "logins_period": logins_period,
+        },
+        "response": {
+            "alerts_total": len(alerts),
+            "alerts_acknowledged": acknowledged,
+            "ack_rate_pct": round(acknowledged / len(alerts) * 100) if alerts else None,
+            "median_ack_minutes": _median(ack_minutes),
+            "median_alert_resolve_minutes": _median(alert_resolve_minutes),
+            "median_incident_resolve_hours": _median(incident_resolve_hours),
+            "police_notified": sum(1 for a in alerts if a.get("police_status") == "notified"),
+        },
+        "people": {
+            "by_role": role_counts,
+            "never_logged_in": len(never_logged_in),
+            "residents": len(residents),
+            "residents_dormant_30d": residents_dormant,
+            "residents_no_unit": residents_no_unit,
+        },
+        "visitors": {"by_hour": by_hour, "by_weekday": by_weekday, "status": pass_status},
+        "trends": {
+            "daily": list(daily.values()),
+            # old shape, kept for compatibility
+            "incidents": [{"id": d["date"], "count": d["incidents"]} for d in daily.values() if d["incidents"]],
+            "visitors": [{"id": d["date"], "count": d["visitors"]} for d in daily.values() if d["visitors"]],
+        },
+        "distributions": {
+            "incident_types": _count_by(incidents, "type"),
+            "incident_severity_open": _count_by(open_incidents, "severity"),
+            "users_by_role": [{"id": k, "count": v} for k, v in role_counts.items()],
+            "pass_status": [{"id": k, "count": v} for k, v in pass_status.items() if v],
+            "alert_status": _count_by(alerts, "status"),
+            "alert_types": _count_by(alerts, "type"),
+        },
+        "engagement": {
+            "posts_last_30d": posts_collection.count_documents({**estate_filter, **in_period}),
+            "posts_period": posts_collection.count_documents({**estate_filter, **in_period}),
+            "welfare_raised_total": welfare_raised_agg[0]["total"] if welfare_raised_agg else 0,
+            "active_campaigns": campaigns_collection.count_documents({**estate_filter, "status": {"$ne": "closed"}}),
+            "pending_donations": pending_donations,
+        },
+        "attention": attention,
+        "setup": setup,
+        "recent_activity": recent_activity,
+    }
+
+
 @app.get("/api/analytics/dashboard")
-async def get_dashboard(start_date: Optional[str] = None, end_date: Optional[str] = None, current_user: Dict = Depends(get_current_user)):
+async def get_dashboard(days: int = 30, current_user: Dict = Depends(get_current_user)):
     role = current_user["role"].lower()
-    # A true platform-wide super_admin (see /api/platform/stats) has no
-    # estate_id at all — this used to convert it to ObjectId() unconditionally
-    # up here and crash with a 500 before ever reaching the super_admin
-    # branch below, which is the one case that doesn't need it.
+    # A true platform-wide super_admin has no estate_id at all.
     estate_id = ObjectId(current_user["estate_id"]) if current_user.get("estate_id") else None
     if role not in ["admin", "super_admin"] and estate_id is None:
         raise HTTPException(status_code=400, detail="Account has no estate")
 
     if role in ["admin", "super_admin"]:
-        date_filter = {}
-        try:
-            if start_date and end_date:
-                date_filter = {"created_at": {"$gte": datetime.fromisoformat(start_date), "$lte": datetime.fromisoformat(end_date)}}
-            elif start_date:
-                date_filter = {"created_at": {"$gte": datetime.fromisoformat(start_date)}}
-            elif end_date:
-                date_filter = {"created_at": {"$lte": datetime.fromisoformat(end_date)}}
-            else:
-                date_filter = {"created_at": {"$gte": datetime.utcnow() - timedelta(days=30)}}
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid date format")
-
+        if days not in ANALYTICS_PERIODS:
+            days = 30
         estate_filter = {} if role == "super_admin" else {"estate_id": estate_id}
-
-        total_visitors = passes_collection.count_documents({**estate_filter, **date_filter})
-        active_incidents = incidents_collection.count_documents({**estate_filter, "status": {"$nin": ["resolved", "closed"]}})
-        total_alerts = alerts_collection.count_documents({**estate_filter, **date_filter})
-        active_alerts = alerts_collection.count_documents({**estate_filter, "status": {"$in": ["active", "acknowledged"]}})
-        recent_activity = list(audit_logs_collection.find({**estate_filter, **date_filter}).sort("timestamp", -1).limit(20))
-
-        incident_trends = list(incidents_collection.aggregate([
-            {"$match": {**estate_filter, **date_filter}},
-            {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$created_at"}}, "count": {"$sum": 1}}},
-            {"$sort": {"_id": 1}}
-        ]))
-        visitor_trends = list(passes_collection.aggregate([
-            {"$match": {**estate_filter, **date_filter}},
-            {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$created_at"}}, "count": {"$sum": 1}}},
-            {"$sort": {"_id": 1}}
-        ]))
-        incident_types = list(incidents_collection.aggregate([
-            {"$match": {**estate_filter, **date_filter}},
-            {"$group": {"_id": "$type", "count": {"$sum": 1}}}
-        ]))
-        # Which open incidents actually need urgent attention right now —
-        # a type breakdown alone doesn't tell an admin what's on fire today.
-        incident_severity_open = list(incidents_collection.aggregate([
-            {"$match": {**estate_filter, "status": {"$nin": ["resolved", "closed"]}}},
-            {"$group": {"_id": "$severity", "count": {"$sum": 1}}}
-        ]))
-        # Roles are the whole picture here, not just a single "users" count —
-        # an admin needs to see residents vs guards vs police at a glance,
-        # and this also makes the invite-cap (3 admins) visible without
-        # digging into the Users page.
-        users_by_role = list(users_collection.aggregate([
-            {"$match": {**estate_filter, "is_active": True}},
-            {"$group": {"_id": "$role", "count": {"$sum": 1}}}
-        ]))
-        pass_status = list(passes_collection.aggregate([
-            {"$match": {**estate_filter, **date_filter}},
-            {"$group": {"_id": "$status", "count": {"$sum": 1}}}
-        ]))
-        alert_status = list(alerts_collection.aggregate([
-            {"$match": {**estate_filter, **date_filter}},
-            {"$group": {"_id": "$status", "count": {"$sum": 1}}}
-        ]))
-        alert_types = list(alerts_collection.aggregate([
-            {"$match": {**estate_filter, **date_filter}},
-            {"$group": {"_id": "$type", "count": {"$sum": 1}}}
-        ]))
-        # Welfare/community are part of "everything happening in the estate"
-        # too, not just security events — surfaced here so admins don't have
-        # to bounce between pages to see if anyone's actually engaging.
-        posts_30d = posts_collection.count_documents({**estate_filter, **date_filter})
-        # Only verified donations count here — an unconfirmed pledge
-        # shouldn't show up as money the estate has actually raised.
-        welfare_raised_agg = list(donations_collection.aggregate([
-            {"$match": {**estate_filter, "status": "verified"}},
-            {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-        ]))
-        welfare_raised_total = welfare_raised_agg[0]["total"] if welfare_raised_agg else 0
-        active_campaigns = campaigns_collection.count_documents({**estate_filter, "status": {"$ne": "closed"}})
-
-        analytics_data = {
-            "summary": {
-                "total_visitors": total_visitors,
-                "active_incidents": active_incidents,
-                "total_alerts": total_alerts,
-                "active_alerts": active_alerts,
-                "total_users": users_collection.count_documents({**estate_filter, "is_active": True})
-            },
-            "trends": {"incidents": incident_trends, "visitors": visitor_trends},
-            "distributions": {
-                "incident_types": incident_types,
-                "incident_severity_open": incident_severity_open,
-                "users_by_role": users_by_role,
-                "pass_status": pass_status,
-                "alert_status": alert_status,
-                "alert_types": alert_types
-            },
-            "engagement": {
-                "posts_last_30d": posts_30d,
-                "welfare_raised_total": welfare_raised_total,
-                "active_campaigns": active_campaigns
-            },
-            "recent_activity": recent_activity
-        }
-        return serialize_doc(analytics_data)
+        estate = None if role == "super_admin" else estates_collection.find_one({"_id": estate_id}, {"settings": 1, "name": 1})
+        return serialize_doc(build_admin_analytics(estate_filter, days, estate))
 
     else:
         data = {
@@ -2305,8 +2612,16 @@ async def sync_offline(actions: List[SyncAction], current_user: Dict = Depends(g
         try:
             result = {"id": action.id}
             if action.type == "validate_visitor":
-                pass_data = passes_collection.find_one({"code": action.data["code"]})
-                if pass_data and str(pass_data["estate_id"]) == str(current_user["estate_id"]):
+                # Same rule as the live validate route: only guards/admins.
+                if current_user["role"] not in ["guard", "admin"]:
+                    results.append({"id": action.id, "success": False, "error": "Unauthorized"})
+                    continue
+                pass_data = passes_collection.find_one({
+                    "code": str(action.data.get("code", "")).strip().upper(),
+                    "estate_id": ObjectId(current_user["estate_id"]),
+                    "status": "active",
+                })
+                if pass_data:
                     passes_collection.update_one(
                         {"_id": pass_data["_id"]},
                         {"$set": {"status": "used", "used_at": action.timestamp, "used_by": ObjectId(current_user["_id"])}}
@@ -2315,19 +2630,34 @@ async def sync_offline(actions: List[SyncAction], current_user: Dict = Depends(g
                 else:
                     result.update({"success": False, "error": "Invalid pass or unauthorized estate"})
             elif action.type == "create_incident":
-                incident_dict = action.data
+                # Validate through the same model as the live route, so an
+                # offline-sync request can't smuggle in arbitrary fields
+                # (status, estate_id, reporter, etc.).
+                incident_dict = IncidentCreate(**action.data).dict(exclude_unset=True)
                 incident_dict.update({
                     "reporter_id": ObjectId(current_user["_id"]),
                     "estate_id": ObjectId(current_user["estate_id"]),
-                    "status": incident_dict.get("status", "reported"),
+                    "reporter_name": current_user.get("name", "Resident"),
+                    "reporter_phone": current_user.get("phone"),
+                    "status": "reported",
                     "created_at": action.timestamp
                 })
                 result_id = incidents_collection.insert_one(incident_dict).inserted_id
                 result.update({"success": True, "data": to_json_serializable({**incident_dict, "id": str(result_id)})})
             elif action.type == "create_alert":
-                alert_dict = action.data
+                uid = str(current_user["_id"])
+                now_ts = datetime.utcnow()
+                alert_rate_limit[uid] = [t for t in alert_rate_limit.get(uid, []) if (now_ts - t).total_seconds() < 60]
+                if len(alert_rate_limit[uid]) >= 5:
+                    results.append({"id": action.id, "success": False, "error": "Too many alerts"})
+                    continue
+                alert_rate_limit[uid].append(now_ts)
+                alert_dict = AlertCreate(**action.data).dict(exclude_unset=True)
                 alert_dict.update({
                     "sender_id": ObjectId(current_user["_id"]),
+                    "sender_name": current_user.get("name", "Resident"),
+                    "sender_phone": current_user.get("phone"),
+                    "sender_role": current_user["role"],
                     "estate_id": ObjectId(current_user["estate_id"]),
                     "created_at": action.timestamp,
                     "status": "active",
@@ -2398,8 +2728,8 @@ async def create_post(post: PostCreate, background_tasks: BackgroundTasks, curre
             f"New event at {(estate or {}).get('name', 'your estate')}",
             branded_email(
                 "New community event",
-                f"<p><strong>{current_user.get('name', 'A neighbour')}</strong> posted a new event:</p>"
-                f"<p style='white-space:pre-wrap;'>{preview}</p>"
+                f"<p><strong>{html.escape(current_user.get('name', 'A neighbour'))}</strong> posted a new event:</p>"
+                f"<p style='white-space:pre-wrap;'>{html.escape(preview)}</p>"
                 f"<p style='margin:20px 0;'><a href=\"{LOGIN_URL}\" style=\"background:#1e2a5e;color:#ffffff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:600;display:inline-block;\">View in NexHood</a></p>"
             )
         )
@@ -2541,9 +2871,12 @@ async def donate(donation: DonationCreate, current_user: Dict = Depends(get_curr
         "status": "pending"
     })
     result = donations_collection.insert_one(donation_dict)
-    # Mock Paystack link (replace with a real Paystack initialize call before launch)
-    paystack_link = f"https://paystack.com/pay/nexhood-{donation.for_role}-{donation.amount}"
-    return {"paystack_link": paystack_link, "donation_id": str(result.inserted_id), "status": "pending"}
+    # SECURITY: this used to return a made-up link like
+    # paystack.com/pay/nexhood-guards-5000. Anyone could create a Paystack
+    # page with that name and collect residents' money. No link is returned
+    # until a real Paystack integration exists; the frontend shows the
+    # admin's payment instructions instead.
+    return {"paystack_link": None, "donation_id": str(result.inserted_id), "status": "pending"}
 
 
 @app.get("/api/welfare/donations/pending")
