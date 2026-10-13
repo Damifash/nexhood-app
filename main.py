@@ -1,4 +1,4 @@
-# NEXHOOD BACKEND BUILD MARKER: v30-2026-10-13-bills-finances-repairs
+# NEXHOOD BACKEND BUILD MARKER: v32-2026-10-13-estate-bills-mobile
 # If /health below doesn't return this exact build string, the running
 # process is NOT this file — kill whatever's on port 8000 and restart.
 from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Request, UploadFile, File, Body, BackgroundTasks
@@ -729,6 +729,15 @@ def require_admin(current_user: Dict = Depends(get_current_user)):
     return current_user
 
 
+def require_money_member(current_user: Dict = Depends(get_current_user)):
+    """Bills, payments and the estate's books are for people who live in the
+    estate (residents) and the people who run it (admins). Guards and police
+    are staff/outsiders: they get gate, alert and incident data only."""
+    if current_user["role"] not in ("resident", "admin", "super_admin"):
+        raise HTTPException(status_code=403, detail="Estate finances are only available to residents and admins")
+    return current_user
+
+
 def require_super_admin(current_user: Dict = Depends(get_current_user)):
     """Platform-owner only — every estate's data, not just one. There's no
     self-serve way to become super_admin (by design); it has to be set
@@ -796,7 +805,7 @@ async def location_update(sid, data):
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-BUILD_VERSION = "v30-2026-10-13-bills-finances-repairs"
+BUILD_VERSION = "v32-2026-10-13-estate-bills-mobile"
 
 
 @app.get("/health")
@@ -3292,7 +3301,7 @@ except Exception as e:
 CHARGE_CATEGORIES = ("service_charge", "security", "power", "water", "waste", "special", "other")
 CHARGE_FREQUENCIES = ("one_off", "monthly", "quarterly", "yearly")
 EXPENSE_CATEGORIES = ("diesel_power", "security_salaries", "repairs", "cleaning_waste", "water", "admin", "other")
-REQUEST_CATEGORIES = ("plumbing", "electrical", "road", "drainage", "waste", "gate_fence", "water", "other")
+REQUEST_CATEGORIES = ("plumbing", "electrical", "roof_building", "road", "drainage", "waste", "gate_fence", "water", "other")
 REQUEST_STATUSES = ("reported", "assigned", "in_progress", "fixed", "closed")
 PAYMENT_METHODS = ("bank_transfer", "cash", "pos", "paystack")
 MAX_PROOF_CHARS = int(1.5 * 1024 * 1024)  # data URI size cap for receipts/proofs
@@ -3398,7 +3407,7 @@ class FinanceSettingsUpdate(BaseModel):
 
 
 @app.get("/api/finance/settings")
-async def get_finance_settings(current_user: Dict = Depends(get_current_user)):
+async def get_finance_settings(current_user: Dict = Depends(require_money_member)):
     s = _finance_settings(_estate_oid(current_user))
     approver = None
     if s.get("approver_user_id"):
@@ -3463,7 +3472,7 @@ def _resolve_members(estate_id: ObjectId, ids: Optional[List[str]]) -> List[Obje
 
 
 @app.get("/api/units")
-async def list_units(current_user: Dict = Depends(get_current_user)):
+async def list_units(current_user: Dict = Depends(require_money_member)):
     estate_id = _estate_oid(current_user)
     q = {"estate_id": estate_id}
     if not _is_admin(current_user):
@@ -3584,7 +3593,7 @@ class IssueBills(BaseModel):
 
 
 @app.get("/api/charges")
-async def list_charges(current_user: Dict = Depends(get_current_user)):
+async def list_charges(current_user: Dict = Depends(require_money_member)):
     return [serialize_doc(c) for c in charges_collection.find({"estate_id": _estate_oid(current_user)}).sort("created_at", -1)]
 
 
@@ -3664,7 +3673,7 @@ async def issue_bills(charge_id: str, body: IssueBills, background_tasks: Backgr
 
 @app.get("/api/invoices")
 async def list_invoices(status: Optional[str] = None, unit_id: Optional[str] = None, period: Optional[str] = None,
-                        current_user: Dict = Depends(get_current_user)):
+                        current_user: Dict = Depends(require_money_member)):
     estate_id = _estate_oid(current_user)
     q: Dict = {"estate_id": estate_id}
     if _is_admin(current_user):
@@ -3750,7 +3759,7 @@ def _confirm_payment(payment: Dict, admin: Dict, background_tasks: Optional[Back
 
 
 @app.post("/api/payments")
-async def create_payment(body: PaymentCreate, background_tasks: BackgroundTasks, current_user: Dict = Depends(get_current_user)):
+async def create_payment(body: PaymentCreate, background_tasks: BackgroundTasks, current_user: Dict = Depends(require_money_member)):
     """Resident: "I've paid" (bank transfer/cash) with a receipt photo. It
     waits for an admin to confirm the money arrived. Admin: records a
     payment they received for a unit; it's confirmed straight away."""
@@ -3793,12 +3802,15 @@ async def create_payment(body: PaymentCreate, background_tasks: BackgroundTasks,
 
 
 @app.get("/api/payments")
-async def list_payments(status: Optional[str] = None, current_user: Dict = Depends(get_current_user)):
+async def list_payments(status: Optional[str] = None, current_user: Dict = Depends(require_money_member)):
     q: Dict = {"estate_id": _estate_oid(current_user)}
     if not _is_admin(current_user):
         q["payer_user_id"] = current_user["_id"]
     if status:
         q["status"] = status
+    else:
+        # Unfinished online checkouts (resident closed the Paystack page) aren't payments.
+        q["status"] = {"$nin": ["initiated", "confirming"]}
     out = []
     for p in payments_collection.find(q, {"proof_image": 0}).sort("created_at", -1).limit(300):
         d = serialize_doc(p)
@@ -3808,7 +3820,7 @@ async def list_payments(status: Optional[str] = None, current_user: Dict = Depen
 
 
 @app.get("/api/payments/{payment_id}/proof")
-async def get_payment_proof(payment_id: str, current_user: Dict = Depends(get_current_user)):
+async def get_payment_proof(payment_id: str, current_user: Dict = Depends(require_money_member)):
     p = payments_collection.find_one({"_id": _oid(payment_id, "payment"), "estate_id": _estate_oid(current_user)}, {"proof_image": 1, "payer_user_id": 1})
     if not p or (not _is_admin(current_user) and p.get("payer_user_id") != current_user["_id"]):
         raise HTTPException(status_code=404, detail="Payment not found")
@@ -3915,7 +3927,7 @@ async def create_expense(body: ExpenseCreate, background_tasks: BackgroundTasks,
 
 
 @app.get("/api/expenses")
-async def list_expenses(month: Optional[str] = None, status: Optional[str] = None, current_user: Dict = Depends(get_current_user)):
+async def list_expenses(month: Optional[str] = None, status: Optional[str] = None, current_user: Dict = Depends(require_money_member)):
     estate_id = _estate_oid(current_user)
     q: Dict = {"estate_id": estate_id}
     if not _is_admin(current_user):
@@ -3938,7 +3950,7 @@ async def list_expenses(month: Optional[str] = None, status: Optional[str] = Non
 
 
 @app.get("/api/expenses/{expense_id}/receipt")
-async def get_expense_receipt(expense_id: str, current_user: Dict = Depends(get_current_user)):
+async def get_expense_receipt(expense_id: str, current_user: Dict = Depends(require_money_member)):
     e = expenses_collection.find_one({"_id": _oid(expense_id, "expense"), "estate_id": _estate_oid(current_user)}, {"receipt_image": 1, "status": 1})
     if not e or (not _is_admin(current_user) and e.get("status") not in ("approved", "void")):
         raise HTTPException(status_code=404, detail="Expense not found")
@@ -3998,7 +4010,7 @@ def _sum(coll, match: Dict, field: str) -> int:
 
 
 @app.get("/api/finance/statement")
-async def finance_statement(month: Optional[str] = None, current_user: Dict = Depends(get_current_user)):
+async def finance_statement(month: Optional[str] = None, current_user: Dict = Depends(require_money_member)):
     """The monthly "where the money went" statement every resident can see."""
     estate_id = _estate_oid(current_user)
     now = datetime.utcnow()
@@ -4052,7 +4064,7 @@ async def finance_arrears(current_user: Dict = Depends(require_admin)):
 
 
 @app.get("/api/finance/me")
-async def finance_me(current_user: Dict = Depends(get_current_user)):
+async def finance_me(current_user: Dict = Depends(require_money_member)):
     estate_id = _estate_oid(current_user)
     units = list(units_collection.find({"estate_id": estate_id, "$or": [{"occupant_user_ids": current_user["_id"]}, {"payer_user_id": current_user["_id"]}]}))
     fin = _finance_settings(estate_id)
@@ -4202,6 +4214,406 @@ async def get_repair_images(repair_id: str, current_user: Dict = Depends(get_cur
     if not r or (r.get("visibility") == "management" and not _is_admin(current_user) and current_user.get("role") != "guard" and r.get("reporter_id") != current_user["_id"]):
         raise HTTPException(status_code=404, detail="Request not found")
     return {"images": r.get("images") or []}
+
+
+# ===========================================================================
+# ONLINE PAYMENTS (Paystack) — dormant until PAYSTACK_SECRET_KEY is set.
+#
+# How the money moves:
+#   resident pays (bill + convenience fee) on Paystack's checkout
+#     -> Paystack splits it: the bill amount settles to the ESTATE's own bank
+#        account (its Paystack subaccount); the convenience fee goes to
+#        NexHood's main Paystack balance, which also pays Paystack's charge.
+#     -> Paystack calls our webhook; we mark the bill paid automatically.
+# NexHood never holds the estate's money.
+# ===========================================================================
+import hmac
+import hashlib
+import urllib.request
+import urllib.error
+import urllib.parse
+
+PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
+PAYSTACK_ENABLED = bool(PAYSTACK_SECRET_KEY)
+# NexHood's margin per online payment, on top of covering Paystack's own fee.
+NEXHOOD_FEE_MARGIN = int(os.getenv("NEXHOOD_FEE_MARGIN", "100"))
+_bank_cache: Dict = {}
+
+
+def _paystack(method: str, path: str, body: Optional[Dict] = None) -> Dict:
+    if not PAYSTACK_ENABLED:
+        raise HTTPException(status_code=503, detail="Online payments aren't switched on yet")
+    req = urllib.request.Request(
+        f"https://api.paystack.co{path}",
+        data=json.dumps(body).encode() if body is not None else None,
+        method=method,
+        headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read().decode()).get("message")
+        except Exception:
+            msg = None
+        logger.error(f"Paystack {method} {path} failed: {e.code} {msg}")
+        raise HTTPException(status_code=400, detail=msg or "Paystack rejected the request")
+    except Exception as e:
+        logger.error(f"Paystack {method} {path} error: {e}")
+        raise HTTPException(status_code=502, detail="Couldn't reach Paystack. Please try again.")
+
+
+def paystack_fee(total_naira: int) -> int:
+    """Paystack Nigeria local fee: 1.5% + N100 (the N100 is waived under
+    N2,500), capped at N2,000."""
+    fee = total_naira * 0.015 + (100 if total_naira >= 2500 else 0)
+    return int(min(-(-fee // 1), 2000))
+
+
+def convenience_fee(bill_naira: int) -> int:
+    """What the resident pays on top of the bill so the estate receives the
+    full bill amount: Paystack's fee on the total + NexHood's margin."""
+    fee = NEXHOOD_FEE_MARGIN
+    for _ in range(5):  # converge: the Paystack fee depends on the total
+        fee = paystack_fee(bill_naira + fee) + NEXHOOD_FEE_MARGIN
+    return fee
+
+
+@app.get("/api/finance/paystack/status")
+async def paystack_status(current_user: Dict = Depends(require_money_member)):
+    fin = _finance_settings(_estate_oid(current_user))
+    return {
+        "enabled": PAYSTACK_ENABLED,
+        "connected": bool(fin.get("paystack_subaccount_code")),
+        "settlement": {"bank_name": fin.get("paystack_bank_name"), "account_name": fin.get("paystack_account_name"),
+                       "account_number": fin.get("paystack_account_number")} if fin.get("paystack_subaccount_code") else None,
+        "fee_margin": NEXHOOD_FEE_MARGIN,
+    }
+
+
+@app.get("/api/finance/paystack/banks")
+async def paystack_banks(current_user: Dict = Depends(require_admin)):
+    if "ng" not in _bank_cache:
+        data = await asyncio.to_thread(_paystack, "GET", "/bank?country=nigeria&perPage=200")
+        _bank_cache["ng"] = sorted([{"name": b["name"], "code": b["code"]} for b in data.get("data", []) if b.get("active", True)], key=lambda b: b["name"])
+    return _bank_cache["ng"]
+
+
+class PaystackConnect(BaseModel):
+    bank_code: str = Field(..., min_length=2, max_length=10)
+    account_number: str = Field(..., min_length=10, max_length=10)
+
+
+@app.post("/api/finance/paystack/connect")
+async def paystack_connect(body: PaystackConnect, current_user: Dict = Depends(require_admin)):
+    """Link the estate's bank account to NexHood's Paystack as a subaccount.
+    Online payments for this estate then settle straight into it."""
+    estate_id = _estate_oid(current_user)
+    estate = estates_collection.find_one({"_id": estate_id}, {"name": 1})
+    resolved = await asyncio.to_thread(_paystack, "GET", f"/bank/resolve?account_number={urllib.parse.quote(body.account_number)}&bank_code={urllib.parse.quote(body.bank_code)}")
+    account_name = (resolved.get("data") or {}).get("account_name")
+    if not account_name:
+        raise HTTPException(status_code=400, detail="We couldn't find that account. Check the number and bank.")
+    banks = {b["code"]: b["name"] for b in await paystack_banks(current_user)}
+    sub = await asyncio.to_thread(_paystack, "POST", "/subaccount", {
+        "business_name": (estate or {}).get("name", "Estate")[:100],
+        "settlement_bank": body.bank_code,
+        "account_number": body.account_number,
+        "percentage_charge": 0,
+        "description": "NexHood estate collections",
+    })
+    code = (sub.get("data") or {}).get("subaccount_code")
+    if not code:
+        raise HTTPException(status_code=400, detail="Paystack didn't create the payout account")
+    estates_collection.update_one({"_id": estate_id}, {"$set": {
+        "finance.paystack_subaccount_code": code,
+        "finance.paystack_bank_name": banks.get(body.bank_code),
+        "finance.paystack_account_name": account_name,
+        "finance.paystack_account_number": body.account_number,
+    }})
+    audit_logs_collection.insert_one({"user_id": current_user["_id"], "estate_id": estate_id, "action": "update_finance_settings",
+                                      "entity": "estate", "details": {"paystack": "connected", "account_name": account_name}, "timestamp": datetime.utcnow()})
+    return await paystack_status(current_user)
+
+
+class PaystackInit(BaseModel):
+    amount: int = Field(..., gt=0)
+    invoice_id: Optional[str] = None
+
+
+@app.get("/api/payments/paystack/quote")
+async def paystack_quote(amount: int, current_user: Dict = Depends(require_money_member)):
+    fee = convenience_fee(int(amount))
+    return {"amount": int(amount), "fee": fee, "total": int(amount) + fee}
+
+
+@app.post("/api/payments/paystack/init")
+async def paystack_init(body: PaystackInit, current_user: Dict = Depends(require_money_member)):
+    estate_id = _estate_oid(current_user)
+    fin = _finance_settings(estate_id)
+    sub = fin.get("paystack_subaccount_code")
+    if not PAYSTACK_ENABLED or not sub:
+        raise HTTPException(status_code=400, detail="Online payment isn't set up for your estate yet. Pay by transfer for now.")
+    mine = {"estate_id": estate_id, "$or": [{"occupant_user_ids": current_user["_id"]}, {"payer_user_id": current_user["_id"]}]}
+    invoice = None
+    if body.invoice_id:
+        invoice = invoices_collection.find_one({"_id": _oid(body.invoice_id, "bill"), "estate_id": estate_id})
+        if not invoice:
+            raise HTTPException(status_code=404, detail="Bill not found")
+        unit = units_collection.find_one({**mine, "_id": invoice["unit_id"]})
+    else:
+        unit = units_collection.find_one(mine)
+    if not unit:
+        raise HTTPException(status_code=404, detail="Your house/flat isn't set up yet")
+    fee = convenience_fee(body.amount)
+    total = body.amount + fee
+    reference = f"NXH-{secrets.token_hex(8).upper()}"
+    payments_collection.insert_one({
+        "estate_id": estate_id, "unit_id": unit["_id"], "unit_label": unit["label"],
+        "invoice_id": invoice["_id"] if invoice else None, "payer_user_id": current_user["_id"], "payer_name": current_user.get("name"),
+        "amount": int(body.amount), "fee": fee, "method": "paystack", "reference": reference, "status": "initiated",
+        "recorded_by": current_user["_id"], "created_at": datetime.utcnow(),
+    })
+    data = await asyncio.to_thread(_paystack, "POST", "/transaction/initialize", {
+        "email": current_user["email"],
+        "amount": total * 100,            # kobo
+        "reference": reference,
+        "subaccount": sub,
+        "transaction_charge": fee * 100,  # NexHood's share (kobo); the estate gets the rest
+        "bearer": "account",              # NexHood's share pays Paystack's fee, so the estate gets the full bill
+        "callback_url": f"{FRONTEND_URL}/app/payments?paystack=1",
+        "metadata": {"estate_id": str(estate_id), "unit_id": str(unit["_id"]), "unit": unit["label"],
+                     "invoice_id": str(invoice["_id"]) if invoice else None, "bill_amount": body.amount, "fee": fee},
+    })
+    url = (data.get("data") or {}).get("authorization_url")
+    if not url:
+        raise HTTPException(status_code=502, detail="Paystack didn't return a checkout link")
+    return {"authorization_url": url, "reference": reference, "amount": body.amount, "fee": fee, "total": total}
+
+
+SYSTEM_PAYSTACK_ACTOR = {"_id": None, "name": "Paystack"}
+
+
+def _settle_paystack(reference: str, background_tasks: Optional[BackgroundTasks] = None) -> Dict:
+    """Verify with Paystack and, if paid, apply it to the bills — exactly
+    once, even if the webhook and the browser redirect both arrive."""
+    pay = payments_collection.find_one({"reference": reference, "method": "paystack"})
+    if not pay:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    if pay["status"] in ("confirmed", "failed"):
+        return {"status": pay["status"]}
+    data = (_paystack("GET", f"/transaction/verify/{urllib.parse.quote(reference)}").get("data") or {})
+    if data.get("status") != "success":
+        if data.get("status") in ("failed", "abandoned", "reversed"):
+            payments_collection.update_one({"_id": pay["_id"], "status": "initiated"}, {"$set": {"status": "failed", "paystack_status": data.get("status")}})
+            return {"status": "failed"}
+        return {"status": "pending"}
+    expected_kobo = (int(pay["amount"]) + int(pay.get("fee", 0))) * 100
+    if int(data.get("amount", 0)) < expected_kobo:
+        logger.error(f"Paystack amount mismatch for {reference}: got {data.get('amount')}, expected {expected_kobo}")
+        payments_collection.update_one({"_id": pay["_id"]}, {"$set": {"status": "failed", "paystack_status": "amount_mismatch"}})
+        return {"status": "failed"}
+    # Claim it atomically so only one caller applies the money.
+    claimed = payments_collection.find_one_and_update({"_id": pay["_id"], "status": "initiated"}, {"$set": {"status": "confirming"}})
+    if not claimed:
+        return {"status": payments_collection.find_one({"_id": pay["_id"]}, {"status": 1}).get("status")}
+    claimed["status"] = "confirming"
+    _confirm_payment(claimed, SYSTEM_PAYSTACK_ACTOR, background_tasks)
+    payments_collection.update_one({"_id": pay["_id"]}, {"$set": {"paystack_paid_at": data.get("paid_at"), "channel": data.get("channel")}})
+    return {"status": "confirmed"}
+
+
+@app.get("/api/payments/paystack/verify")
+async def paystack_verify(reference: str, background_tasks: BackgroundTasks, current_user: Dict = Depends(require_money_member)):
+    pay = payments_collection.find_one({"reference": reference, "estate_id": _estate_oid(current_user)}, {"_id": 1})
+    if not pay:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    return await asyncio.to_thread(_settle_paystack, reference, background_tasks)
+
+
+@app.post("/api/paystack/webhook")
+async def paystack_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Paystack calls this when a payment succeeds. The signature proves it
+    really came from Paystack; we still re-verify the transaction."""
+    raw = await request.body()
+    signature = request.headers.get("x-paystack-signature", "")
+    if not PAYSTACK_ENABLED or not hmac.compare_digest(hmac.new(PAYSTACK_SECRET_KEY.encode(), raw, hashlib.sha512).hexdigest(), signature):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+    try:
+        event = json.loads(raw.decode())
+    except Exception:
+        return {"ok": True}
+    if event.get("event") == "charge.success":
+        ref = (event.get("data") or {}).get("reference")
+        if ref and ref.startswith("NXH-"):
+            try:
+                await asyncio.to_thread(_settle_paystack, ref, background_tasks)
+            except HTTPException as e:
+                logger.error(f"Webhook settle failed for {ref}: {e.detail}")
+    return {"ok": True}
+
+
+# ===========================================================================
+# RED DOTS: "what's new for me" counts per section of the app.
+# Each user has a last-seen time per section; opening the page clears it.
+# ===========================================================================
+NOTIFY_SECTIONS = ("alerts", "incidents", "community", "payments", "finances", "repairs", "visitor_passes", "welfare")
+
+
+def _seen(user: Dict, section: str) -> datetime:
+    t = (user.get("seen") or {}).get(section)
+    return t or max(user.get("created_at") or datetime.utcnow(), datetime.utcnow() - timedelta(days=7))
+
+
+@app.get("/api/notifications/counts")
+async def notification_counts(current_user: Dict = Depends(get_current_user)):
+    estate_id = _estate_oid(current_user)
+    me = current_user["_id"]
+    role = current_user.get("role")
+    admin = role in ("admin", "super_admin")
+    staff = admin or role == "guard"
+    my_units = [u["_id"] for u in units_collection.find({"estate_id": estate_id, "$or": [{"occupant_user_ids": me}, {"payer_user_id": me}]}, {"_id": 1})]
+    out: Dict = {}
+    urgent: Dict = {}
+
+    # Alerts: new ones raised by others; for guards/admins, any still unanswered is urgent.
+    out["alerts"] = alerts_collection.count_documents({"estate_id": estate_id, "sender_id": {"$ne": me}, "created_at": {"$gt": _seen(current_user, "alerts")}})
+    if staff:
+        urgent["alerts"] = alerts_collection.count_documents({"estate_id": estate_id, "status": "active"})
+
+    out["incidents"] = incidents_collection.count_documents({"estate_id": estate_id, "reporter_id": {"$ne": me}, "created_at": {"$gt": _seen(current_user, "incidents")}})
+    out["community"] = posts_collection.count_documents({"estate_id": estate_id, "author_id": {"$ne": me}, "created_at": {"$gt": _seen(current_user, "community")}})
+
+    since_rep = _seen(current_user, "repairs")
+    rq = {"estate_id": estate_id, "reporter_id": {"$ne": me}, "created_at": {"$gt": since_rep}}
+    if not staff:
+        rq["visibility"] = "estate"
+    out["repairs"] = requests_collection.count_documents(rq) + requests_collection.count_documents(
+        {"estate_id": estate_id, "reporter_id": me, "updates.at": {"$gt": since_rep}})
+
+    money = role in ("resident", "admin", "super_admin")
+    since_pay = _seen(current_user, "payments")
+    if not money:
+        pass  # guards and police never see bills, payments or the estate books
+    elif admin:
+        urgent["payments"] = payments_collection.count_documents({"estate_id": estate_id, "status": "pending"})
+        out["payments"] = payments_collection.count_documents({"estate_id": estate_id, "status": "confirmed", "method": "paystack", "confirmed_at": {"$gt": since_pay}})
+    else:
+        out["payments"] = invoices_collection.count_documents({"unit_id": {"$in": my_units}, "created_at": {"$gt": since_pay}}) + \
+            payments_collection.count_documents({"payer_user_id": me, "$or": [{"confirmed_at": {"$gt": since_pay}}, {"rejected_at": {"$gt": since_pay}}]})
+        urgent["payments"] = invoices_collection.count_documents({"unit_id": {"$in": my_units}, "status": {"$in": ["unpaid", "part_paid"]}, "due_date": {"$lt": datetime.utcnow()}})
+
+    if admin:
+        approver = _finance_settings(estate_id).get("approver_user_id")
+        q = {"estate_id": estate_id, "status": "pending_approval"}
+        if approver:
+            urgent["finances"] = expenses_collection.count_documents(q) if approver == me else 0
+        else:
+            urgent["finances"] = expenses_collection.count_documents({**q, "created_by": {"$ne": me}})
+    if money:
+        out["finances"] = expenses_collection.count_documents({"estate_id": estate_id, "status": "approved", "created_by": {"$ne": me},
+                                                               "approved_at": {"$gt": _seen(current_user, "finances")}})
+
+    since_vp = _seen(current_user, "visitor_passes")
+    if role == "guard":
+        out["visitor_passes"] = passes_collection.count_documents({"estate_id": estate_id, "created_at": {"$gt": since_vp}, "status": "active"})
+    else:
+        out["visitor_passes"] = passes_collection.count_documents({"estate_id": estate_id, "host_id": me, "used_at": {"$gt": since_vp}})
+
+    out["welfare"] = campaigns_collection.count_documents({"estate_id": estate_id, "created_by": {"$ne": me}, "created_at": {"$gt": _seen(current_user, "welfare")}})
+    if admin:
+        urgent["welfare"] = donations_collection.count_documents({"estate_id": estate_id, "status": "pending"})
+
+    return {"new": out, "urgent": urgent}
+
+
+class SeenBody(BaseModel):
+    section: str
+
+
+@app.post("/api/notifications/seen")
+async def notification_seen(body: SeenBody, current_user: Dict = Depends(get_current_user)):
+    if body.section not in NOTIFY_SECTIONS:
+        raise HTTPException(status_code=400, detail="Unknown section")
+    users_collection.update_one({"_id": current_user["_id"]}, {"$set": {f"seen.{body.section}": datetime.utcnow()}})
+    return {"ok": True}
+
+
+
+# ---------------------------------------------------------------------------
+# v32 (estate): bills setup checklist + payment reminders
+# ---------------------------------------------------------------------------
+@app.get("/api/finance/setup")
+async def finance_setup(current_user: Dict = Depends(require_admin)):
+    """One call that tells the admin what's left before residents can be billed."""
+    estate_id = _estate_oid(current_user)
+    fin = _finance_settings(estate_id)
+    units = list(units_collection.find({"estate_id": estate_id, "active": True}, {"unit_type": 1, "label": 1}))
+    priced_types = set()
+    for c in charges_collection.find({"estate_id": estate_id, "active": True}, {"type_amounts": 1}):
+        priced_types.update((c.get("type_amounts") or {}).keys())
+    untyped = [u["label"] for u in units if priced_types and (u.get("unit_type") or "") not in priced_types]
+    return {
+        "bank": bool(fin.get("account_number")),
+        "units": len(units),
+        "units_untyped": len(untyped),
+        "untyped_labels": untyped[:10],
+        "price_types": sorted(priced_types),
+        "charges": charges_collection.count_documents({"estate_id": estate_id, "active": True}),
+        "invoices": invoices_collection.count_documents({"estate_id": estate_id, "status": {"$ne": "void"}}),
+        "paystack": bool(fin.get("paystack_subaccount_code")),
+        "approver": bool(fin.get("approver_user_id")),
+    }
+
+
+class RemindBody(BaseModel):
+    unit_id: Optional[str] = None
+
+
+@app.post("/api/finance/remind")
+async def finance_remind(body: RemindBody, background_tasks: BackgroundTasks, current_user: Dict = Depends(require_admin)):
+    """Email a polite reminder to whoever pays for each house that owes.
+    One house (unit_id) or everyone who owes. A house is reminded at most
+    once every 20 hours, so a double tap never spams anyone."""
+    estate_id = _estate_oid(current_user)
+    q: Dict = {"estate_id": estate_id, "active": True}
+    if body.unit_id:
+        q["_id"] = _oid(body.unit_id, "unit")
+    estate = estates_collection.find_one({"_id": estate_id}, {"name": 1}) or {}
+    fin = _finance_settings(estate_id)
+    now = datetime.utcnow()
+    sent = skipped = 0
+    for u in units_collection.find(q):
+        due = _unit_balance(u["_id"])
+        if due <= 0:
+            continue
+        last = u.get("last_reminded_at")
+        if last and (now - last) < timedelta(hours=20):
+            skipped += 1
+            continue
+        emails = _unit_payer_emails(u)
+        if not emails:
+            skipped += 1
+            continue
+        bank = ""
+        if fin.get("account_number"):
+            bank = (f"<p>Pay by transfer to <strong>{html.escape(fin.get('account_name') or '')}</strong>, "
+                    f"{html.escape(fin.get('bank_name') or '')}, <strong>{html.escape(fin.get('account_number'))}</strong>, "
+                    f"then tap “I paid” in NexHood.</p>")
+        body_html = (f"<p>Hello,</p><p>This is a friendly reminder that <strong>{html.escape(u.get('label') or 'your house')}</strong> "
+                     f"has <strong>{_naira(due)}</strong> outstanding on estate bills at {html.escape(estate.get('name') or 'your estate')}.</p>"
+                     + bank +
+                     f"<p><a href=\"{FRONTEND_URL}/app/payments\">See your bills and pay in NexHood</a></p>"
+                     f"<p>If you've already paid, please ignore this. Your admin will confirm it shortly.</p>")
+        for e in emails[:2]:
+            background_tasks.add_task(send_email, e, f"Reminder: {_naira(due)} due for {u.get('label') or 'your house'}",
+                                      branded_email("Bill reminder", body_html))
+        units_collection.update_one({"_id": u["_id"]}, {"$set": {"last_reminded_at": now}})
+        sent += 1
+    audit_logs_collection.insert_one({"user_id": current_user["_id"], "estate_id": estate_id, "action": "remind", "entity": "finance",
+                                      "entity_id": body.unit_id or "all", "details": {"sent": sent}, "timestamp": now})
+    return {"sent": sent, "skipped": skipped}
 
 
 app.mount("/", socketio.ASGIApp(sio, socketio_path="socket.io"))
