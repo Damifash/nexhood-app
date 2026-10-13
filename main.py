@@ -1,4 +1,4 @@
-# NEXHOOD BACKEND BUILD MARKER: v32-2026-10-13-estate-bills-mobile
+# NEXHOOD BACKEND BUILD MARKER: v33-2026-10-13-alerts-on-phones
 # If /health below doesn't return this exact build string, the running
 # process is NOT this file — kill whatever's on port 8000 and restart.
 from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Request, UploadFile, File, Body, BackgroundTasks
@@ -521,8 +521,8 @@ class EstateProfileUpdate(BaseModel):
 
 
 class AlertCreate(BaseModel):
-    type: str = Field(..., pattern="^(panic|emergency|security_breach|fire|medical|general)$")
-    message: Optional[str] = None
+    type: str = Field(..., pattern="^(panic|emergency|security_breach|fire|medical|general|drill)$")
+    message: Optional[str] = Field(None, max_length=500)
     location: Optional[Dict] = None
     priority: str = Field("high", pattern="^(low|medium|high|critical)$")
 
@@ -805,7 +805,7 @@ async def location_update(sid, data):
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-BUILD_VERSION = "v32-2026-10-13-estate-bills-mobile"
+BUILD_VERSION = "v33-2026-10-13-alerts-on-phones"
 
 
 @app.get("/health")
@@ -1680,8 +1680,15 @@ async def create_alert(alert: AlertCreate, background_tasks: BackgroundTasks, cu
             raise HTTPException(status_code=429, detail="Too many alerts, please try again later")
         alert_rate_limit[user_id].append(current_time)
 
+        is_drill = alert.type == "drill"
+        if is_drill and current_user["role"] not in ("admin", "super_admin"):
+            raise HTTPException(status_code=403, detail="Only an admin can run a test alert")
+
         alert_dict = alert.dict(exclude_unset=True)
         alert_dict.update({
+            "sender_apartment": _alert_location_label(current_user),
+            "is_drill": is_drill,
+            "escalation_level": 0,
             "sender_id": ObjectId(current_user["_id"]),
             "sender_name": current_user.get("name", "Resident"),
             # Denormalized so admins/guards can tap-to-call whoever raised
@@ -1689,7 +1696,7 @@ async def create_alert(alert: AlertCreate, background_tasks: BackgroundTasks, cu
             "sender_phone": current_user.get("phone"),
             "estate_id": ObjectId(current_user["estate_id"]),
             "sender_role": current_user["role"],
-            "priority": "critical" if getattr(alert, "type", None) == "panic" else alert.priority,
+            "priority": "critical" if getattr(alert, "type", None) == "panic" else ("high" if is_drill else alert.priority),
             "status": "active",
             "created_at": datetime.utcnow(),
             "acknowledged_by": []
@@ -1703,7 +1710,18 @@ async def create_alert(alert: AlertCreate, background_tasks: BackgroundTasks, cu
             "sender": current_user.get("name", "Resident")
         }, room=f"estate_{current_user['estate_id']}")
 
-        if alert.priority in ["high", "critical"] or alert_dict["priority"] == "critical":
+        # Phones first: a push notification (with vibration) to every guard
+        # and admin, then a follow-up if nobody responds. Email below is
+        # only a written backup.
+        try:
+            background_tasks.add_task(_push_alert_to_staff, inserted_alert, 0)
+            _task = asyncio.create_task(_escalate_unanswered_alert(inserted_alert["_id"]))
+            _ALERT_TASKS.add(_task)
+            _task.add_done_callback(_ALERT_TASKS.discard)
+        except Exception as push_err:
+            logger.warning(f"Alert push scheduling failed: {push_err}")
+
+        if not is_drill and (alert.priority in ["high", "critical"] or alert_dict["priority"] == "critical"):
             estate = estates_collection.find_one({"_id": ObjectId(current_user["estate_id"])})
             emergency_contacts = (estate or {}).get("settings", {}).get("emergencyContacts", [])
             # Notify BOTH the estate's configured emergency contacts AND every
@@ -1726,8 +1744,9 @@ async def create_alert(alert: AlertCreate, background_tasks: BackgroundTasks, cu
                     f"<p>A {alert_dict['priority']} priority alert was raised at <strong>{(estate or {}).get('name', 'your estate')}</strong>.</p>"
                     f"<p><strong>{alert.type.replace('_', ' ').title()}</strong></p>"
                     f"<p>{html.escape(alert.message or 'No details provided')}</p>"
+                    f"<p><strong>Where:</strong> {html.escape(alert_dict.get('sender_apartment') or 'not on file')}</p>"
                     f"<p>Raised by {html.escape(current_user.get('name', 'a resident'))}"
-                    f"{' — ' + current_user.get('phone') if current_user.get('phone') else ''}.</p>"
+                    f"{' · ' + html.escape(current_user.get('phone')) if current_user.get('phone') else ''}.</p>"
                     f"<p style='margin:20px 0;'><a href=\"{LOGIN_URL}\" style=\"background:#1e2a5e;color:#ffffff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:600;display:inline-block;\">Open NexHood</a></p>"
                 )
             )
@@ -1762,10 +1781,21 @@ async def acknowledge_alert(alert_id: str, current_user: Dict = Depends(get_curr
     if not any(ack["user_id"] == ObjectId(current_user["_id"]) for ack in alert.get("acknowledged_by", [])):
         alerts_collection.update_one(
             {"_id": ObjectId(alert_id)},
-            {"$push": {"acknowledged_by": {"user_id": ObjectId(current_user["_id"]), "role": current_user["role"], "timestamp": datetime.utcnow()}},
+            {"$push": {"acknowledged_by": {"user_id": ObjectId(current_user["_id"]), "role": current_user["role"], "name": current_user.get("name"),
+                                           "phone": current_user.get("phone"), "timestamp": datetime.utcnow()}},
              "$set": {"status": "acknowledged" if alert["status"] == "active" else alert["status"]}}
         )
     updated_alert = alerts_collection.find_one({"_id": ObjectId(alert_id)})
+    # Tell the person who raised it that help is coming.
+    if alert.get("sender_id") and alert["sender_id"] != ObjectId(current_user["_id"]):
+        try:
+            await asyncio.to_thread(_push_to_users, {"_id": alert["sender_id"]}, {
+                "kind": "ack", "title": f"{current_user.get('name', 'Security')} is responding",
+                "body": f"Your {alert.get('type', 'alert').replace('_', ' ')} alert was seen by {current_user.get('role')} {current_user.get('name', '')}. Stay safe.",
+                "url": "/app/alerts", "tag": f"ack-{alert_id}", "alert_id": alert_id,
+            })
+        except Exception as push_err:
+            logger.warning(f"Ack push failed: {push_err}")
     await sio.emit("alert_acknowledged", {
         "alert": serialize_doc(updated_alert),
         "acknowledged_by": {"name": current_user["name"], "role": current_user["role"]}
@@ -4614,6 +4644,156 @@ async def finance_remind(body: RemindBody, background_tasks: BackgroundTasks, cu
     audit_logs_collection.insert_one({"user_id": current_user["_id"], "estate_id": estate_id, "action": "remind", "entity": "finance",
                                       "entity_id": body.unit_id or "all", "details": {"sent": sent}, "timestamp": now})
     return {"sent": sent, "skipped": skipped}
+
+
+
+# ---------------------------------------------------------------------------
+# Alerts on phones: Web Push (vibration + notification even when the app is
+# closed), live alert feed, and escalation when nobody answers.
+# ---------------------------------------------------------------------------
+try:
+    from pywebpush import webpush, WebPushException
+    _PUSH_LIB = True
+except Exception:  # library not installed yet: everything else keeps working
+    _PUSH_LIB = False
+VAPID_PUBLIC_KEY = os.getenv("VAPID_PUBLIC_KEY", "").strip()
+VAPID_PRIVATE_KEY = os.getenv("VAPID_PRIVATE_KEY", "").strip()
+VAPID_SUBJECT = os.getenv("VAPID_SUBJECT", "mailto:fasoro@nexhoodapp.com").strip()
+PUSH_ENABLED = bool(_PUSH_LIB and VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY)
+_ALERT_TASKS: set = set()  # keeps escalation timers alive until they finish
+ALERT_TYPE_LABEL = {"panic": "PANIC", "emergency": "Emergency", "security_breach": "Security breach", "fire": "Fire",
+                    "medical": "Medical", "general": "General alert", "drill": "TEST ALERT (drill)"}
+
+
+def _alert_location_label(user: Dict) -> Optional[str]:
+    """Where the alert came from: the house/flat on the user's unit, else the
+    apartment on their profile."""
+    try:
+        unit = units_collection.find_one({"estate_id": ObjectId(user["estate_id"]), "active": True,
+                                          "$or": [{"occupant_user_ids": ObjectId(user["_id"])}, {"payer_user_id": ObjectId(user["_id"])}]},
+                                         {"label": 1})
+        if unit and unit.get("label"):
+            return unit["label"]
+    except Exception:
+        pass
+    apt = (user.get("apartment") or "").strip()
+    return apt or None
+
+
+def _push_to_users(user_filter: Dict, payload: Dict) -> int:
+    """Send one push to every saved phone/browser of the matching users.
+    Dead subscriptions (uninstalled, permission revoked) are removed."""
+    if not PUSH_ENABLED:
+        return 0
+    sent = 0
+    data = json.dumps(payload)
+    for u in users_collection.find({**user_filter, "push_subscriptions": {"$exists": True, "$ne": []}}, {"push_subscriptions": 1}):
+        for sub in u.get("push_subscriptions") or []:
+            try:
+                webpush(subscription_info={"endpoint": sub.get("endpoint"), "keys": sub.get("keys") or {}}, data=data,
+                        vapid_private_key=VAPID_PRIVATE_KEY, vapid_claims={"sub": VAPID_SUBJECT},
+                        ttl=900, headers={"Urgency": "high"}, timeout=10)
+                sent += 1
+            except WebPushException as e:
+                code = getattr(getattr(e, "response", None), "status_code", None)
+                if code in (404, 410):
+                    users_collection.update_one({"_id": u["_id"]}, {"$pull": {"push_subscriptions": {"endpoint": sub.get("endpoint")}}})
+                else:
+                    logger.warning(f"Push failed ({code}): {e}")
+            except Exception as e:
+                logger.warning(f"Push failed: {e}")
+    return sent
+
+
+def _alert_push_payload(a: Dict, level: int) -> Dict:
+    label = ALERT_TYPE_LABEL.get(a.get("type"), "Alert")
+    where = a.get("sender_apartment") or "location not on file"
+    who = a.get("sender_name") or "A resident"
+    if level == 0:
+        title = f"🚨 {label} · {where}"
+        body = f"{who} needs help. Tap to respond." + (f" “{a.get('message')}”" if a.get("message") else "")
+    else:
+        mins = 1 if level == 1 else 3
+        title = f"🚨 NO ONE HAS RESPONDED ({mins} min) · {where}"
+        body = f"{label} from {who} is still unanswered. Tap to respond now."
+    return {"kind": "alert", "title": title, "body": body, "url": "/app/alerts", "tag": f"alert-{a['_id']}",
+            "alert_id": str(a["_id"]), "level": level, "drill": bool(a.get("is_drill"))}
+
+
+def _push_alert_to_staff(a: Dict, level: int = 0) -> int:
+    roles = ["guard", "admin", "super_admin"] if level < 2 else ["guard", "admin", "super_admin", "police"]
+    return _push_to_users({"estate_id": a["estate_id"], "role": {"$in": roles}, "is_active": True, "_id": {"$ne": a.get("sender_id")}},
+                          _alert_push_payload(a, level))
+
+
+async def _escalate_unanswered_alert(alert_id: ObjectId) -> None:
+    """If nobody acknowledges: push again at 1 minute, then at 3 minutes
+    (also to police accounts) plus a written email to admins."""
+    for level, wait in ((1, 60), (2, 120)):
+        await asyncio.sleep(wait)
+        try:
+            a = alerts_collection.find_one({"_id": alert_id})
+            if not a or a.get("status") != "active":
+                return
+            alerts_collection.update_one({"_id": alert_id}, {"$set": {"escalation_level": level, f"escalated_{level}_at": datetime.utcnow()}})
+            await asyncio.to_thread(_push_alert_to_staff, a, level)
+            await sio.emit("alert_escalated", {"alert_id": str(alert_id), "level": level}, room=f"estate_{a['estate_id']}")
+            if level == 2 and not a.get("is_drill"):
+                admins = [u.get("email") for u in users_collection.find({"estate_id": a["estate_id"], "role": "admin", "is_active": True}, {"email": 1})]
+                notify_by_email([e for e in admins if e], "NexHood: alert still unanswered after 3 minutes",
+                                branded_email("Nobody has responded", f"<p>A {html.escape(ALERT_TYPE_LABEL.get(a.get('type'), 'alert'))} alert from "
+                                              f"{html.escape(a.get('sender_name') or 'a resident')} at {html.escape(a.get('sender_apartment') or 'an unknown location')} "
+                                              f"has not been acknowledged. Call your guards now.</p>"))
+        except Exception as e:
+            logger.warning(f"Escalation check failed: {e}")
+            return
+
+
+class PushSubscriptionBody(BaseModel):
+    endpoint: str = Field(..., max_length=1000)
+    keys: Dict[str, str]
+
+
+@app.get("/api/push/public-key")
+async def push_public_key():
+    return {"enabled": PUSH_ENABLED, "public_key": VAPID_PUBLIC_KEY if PUSH_ENABLED else None}
+
+
+@app.post("/api/push/subscribe")
+async def push_subscribe(body: PushSubscriptionBody, current_user: Dict = Depends(get_current_user)):
+    if not body.endpoint.startswith("https://"):
+        raise HTTPException(status_code=400, detail="Invalid subscription")
+    sub = {"endpoint": body.endpoint, "keys": {"p256dh": body.keys.get("p256dh", ""), "auth": body.keys.get("auth", "")}, "added_at": datetime.utcnow()}
+    uid = ObjectId(current_user["_id"])
+    users_collection.update_one({"_id": uid}, {"$pull": {"push_subscriptions": {"endpoint": body.endpoint}}})
+    # Keep the 5 most recent devices per person.
+    users_collection.update_one({"_id": uid}, {"$push": {"push_subscriptions": {"$each": [sub], "$slice": -5}}})
+    return {"ok": True, "enabled": PUSH_ENABLED}
+
+
+@app.post("/api/push/unsubscribe")
+async def push_unsubscribe(body: PushSubscriptionBody, current_user: Dict = Depends(get_current_user)):
+    users_collection.update_one({"_id": ObjectId(current_user["_id"])}, {"$pull": {"push_subscriptions": {"endpoint": body.endpoint}}})
+    return {"ok": True}
+
+
+@app.post("/api/push/test")
+async def push_test(current_user: Dict = Depends(get_current_user)):
+    """Sends a test notification to this person's own devices."""
+    n = await asyncio.to_thread(_push_to_users, {"_id": ObjectId(current_user["_id"])}, {
+        "kind": "test", "title": "NexHood alerts are on", "body": "This is how an emergency will reach this phone.",
+        "url": "/app/alerts", "tag": "nexhood-test"})
+    return {"sent": n, "enabled": PUSH_ENABLED}
+
+
+@app.get("/api/alerts/active")
+async def active_alerts(current_user: Dict = Depends(get_current_user)):
+    """Unresolved alerts from the last 24 hours: polled by the app every few
+    seconds as a backup to the live socket, so a guard never misses one."""
+    since = datetime.utcnow() - timedelta(hours=24)
+    rows = alerts_collection.find({"estate_id": ObjectId(current_user["estate_id"]), "status": {"$in": ["active", "acknowledged"]},
+                                   "created_at": {"$gte": since}}).sort("created_at", -1).limit(20)
+    return [serialize_doc(a) for a in rows]
 
 
 app.mount("/", socketio.ASGIApp(sio, socketio_path="socket.io"))

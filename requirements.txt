@@ -12,3 +12,4 @@ python-socketio==5.11.4
 python-multipart==0.0.20
 resend==2.5.1
 itsdangerous==2.2.0
+pywebpush==1.14.1
