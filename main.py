@@ -1,4 +1,4 @@
-# NEXHOOD BACKEND BUILD MARKER: v33-2026-10-13-alerts-on-phones
+# NEXHOOD BACKEND BUILD MARKER: v35-2026-10-14-security-darkmode
 # If /health below doesn't return this exact build string, the running
 # process is NOT this file — kill whatever's on port 8000 and restart.
 from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Request, UploadFile, File, Body, BackgroundTasks
@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, Field, ValidationError, field_validator
 from pymongo import MongoClient
 from bson import ObjectId
+from bson.errors import InvalidId
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 import os
@@ -105,6 +106,12 @@ app = FastAPI(
     redoc_url="/redoc" if _docs_on else None,
     openapi_url="/openapi.json" if _docs_on else None,
 )
+
+
+@app.exception_handler(InvalidId)
+async def _invalid_id_handler(request: Request, exc: InvalidId):
+    # A malformed id in the URL is simply "not found", not a server error.
+    return JSONResponse(status_code=404, content={"detail": "Not found"})
 
 # Initialize Socket.IO
 # This was set to an empty list, which blocks every origin — real-time
@@ -473,8 +480,8 @@ class IncidentCreate(BaseModel):
     @field_validator("images")
     @classmethod
     def _cap_images(cls, v):
-        if v and sum(len(i) for i in v) > 6 * 1024 * 1024:
-            raise ValueError("Photos are too large (max about 4MB in total)")
+        if v and sum(len(i) for i in v) > int(2.5 * 1024 * 1024):
+            raise ValueError("Photos are too large (max about 2MB in total)")
         return v
 
 
@@ -500,7 +507,8 @@ class ProfileUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=2)
     phone: Optional[str] = None
     email: Optional[EmailStr] = None
-    apartment: Optional[str] = None
+    apartment: Optional[str] = Field(None, max_length=60)
+    current_password: Optional[str] = None
 
     @field_validator("phone")
     @classmethod
@@ -544,8 +552,8 @@ class PostCreate(BaseModel):
     def _cap_images(cls, v):
         # Images are stored inside the database document itself, and the
         # free database is 512MB for every estate combined. Cap total size.
-        if v and sum(len(i) for i in v) > 6 * 1024 * 1024:
-            raise ValueError("Images are too large (max about 4MB in total)")
+        if v and sum(len(i) for i in v) > int(2.5 * 1024 * 1024):
+            raise ValueError("Photos are too large (max about 2MB in total)")
         return v
 
 
@@ -712,15 +720,41 @@ def create_access_token(data: dict) -> str:
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict:
     try:
         payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[ALGORITHM])
+        if not ObjectId.is_valid(str(payload.get("user_id", ""))):
+            raise HTTPException(status_code=401, detail="Invalid token")
         user = users_collection.find_one({"_id": ObjectId(payload["user_id"])})
         if not user or not user.get("is_active", True):
             raise HTTPException(status_code=401, detail="Invalid token")
+        # Changing or resetting a password bumps token_version, which logs
+        # out every other phone/browser still holding an old token.
+        if int(payload.get("tv", 0)) != int(user.get("token_version", 0)):
+            raise HTTPException(status_code=401, detail="Your session has ended. Please log in again.")
         if not user.get("estate_id"):
             raise HTTPException(status_code=400, detail="User must be associated with an estate")
-        users_collection.update_one({"_id": user["_id"]}, {"$set": {"last_seen": datetime.utcnow()}})
+        # Polling hits the API every few seconds: only write last_seen once a minute.
+        if not user.get("last_seen") or (datetime.utcnow() - user["last_seen"]).total_seconds() > 60:
+            users_collection.update_one({"_id": user["_id"]}, {"$set": {"last_seen": datetime.utcnow()}})
         return user
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+
+# Fields that must never leave the server in a user object.
+SENSITIVE_USER_FIELDS = {"password", "reset_token", "reset_token_expires", "push_subscriptions", "seen", "token_version"}
+
+_rate_buckets: Dict[str, List[datetime]] = defaultdict(list)
+
+
+def _rate_limit(key: str, limit: int, window_seconds: int, message: str = "You're doing that too often. Please wait a little and try again.") -> None:
+    """Simple in-memory limiter (one server instance): at most `limit`
+    actions per `window_seconds` for this key."""
+    now = datetime.utcnow()
+    bucket = [t for t in _rate_buckets[key] if (now - t).total_seconds() < window_seconds]
+    if len(bucket) >= limit:
+        _rate_buckets[key] = bucket
+        raise HTTPException(status_code=429, detail=message)
+    bucket.append(now)
+    _rate_buckets[key] = bucket
 
 
 def require_admin(current_user: Dict = Depends(get_current_user)):
@@ -765,11 +799,16 @@ async def join_estate(sid, data):
     token = data.get("token")
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
-        user = users_collection.find_one({"_id": ObjectId(payload["user_id"])})
-        if not user or str(user.get("estate_id")) != data["estate_id"]:
+        user = users_collection.find_one({"_id": ObjectId(payload["user_id"])}) if ObjectId.is_valid(str(payload.get("user_id", ""))) else None
+        if (not user or str(user.get("estate_id")) != data.get("estate_id") or not user.get("is_active", True)
+                or int(payload.get("tv", 0)) != int(user.get("token_version", 0))):
             await sio.disconnect(sid)
             return
         await sio.enter_room(sid, f"estate_{data['estate_id']}")
+        # Staff room (gate codes, alert details) and a personal room.
+        if user.get("role") in ("guard", "admin", "super_admin"):
+            await sio.enter_room(sid, f"estate_{data['estate_id']}_staff")
+        await sio.enter_room(sid, f"user_{user['_id']}")
         logger.info(f"User {payload['user_id']} joined estate {data['estate_id']}")
     except JWTError:
         await sio.disconnect(sid)
@@ -805,7 +844,7 @@ async def location_update(sid, data):
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-BUILD_VERSION = "v33-2026-10-13-alerts-on-phones"
+BUILD_VERSION = "v35-2026-10-14-security-darkmode"
 
 
 @app.get("/health")
@@ -908,9 +947,9 @@ async def register(user: UserCreate):
             {"$set": {"admin_id": result.inserted_id}}
         )
 
-    token = create_access_token({"user_id": str(result.inserted_id), "role": user_dict["role"]})
+    token = create_access_token({"user_id": str(result.inserted_id), "role": user_dict["role"], "tv": 0})
 
-    response_user = to_json_serializable({k: v for k, v in user_dict.items() if k != "password"})
+    response_user = to_json_serializable({k: v for k, v in user_dict.items() if k not in SENSITIVE_USER_FIELDS})
     response_user["id"] = str(result.inserted_id)
     response_user["estate_name"] = estate_name
 
@@ -920,7 +959,7 @@ async def register(user: UserCreate):
         "action": "create",
         "entity": "user",
         "entity_id": str(result.inserted_id),
-        "details": {k: v for k, v in user_dict.items() if k != "password"},
+        "details": {k: v for k, v in user_dict.items() if k not in SENSITIVE_USER_FIELDS},
         "timestamp": datetime.utcnow()
     })
 
@@ -929,14 +968,14 @@ async def register(user: UserCreate):
         user.email,
         f"Welcome to NexHood, {user.name.split(' ')[0]}!",
         branded_email(
-            f"Welcome to {estate_name}",
+            f"Welcome to {html.escape(estate_name)}",
             f"<p>Hi {html.escape(user.name)},</p>"
             f"<p>Your NexHood account is ready. "
             + (
-                f"Since you're the first person to register {estate_name}, you're now this estate's admin — "
+                f"Since you're the first person to register {html.escape(estate_name)}, you're now this estate's admin — "
                 f"you can invite guards, residents and police, and manage everything from the dashboard."
                 if became_admin else
-                f"You're all set as a resident of {estate_name}."
+                f"You're all set as a resident of {html.escape(estate_name)}."
             )
             + "</p>"
             f"<p>From the app you can raise alerts, report incidents, issue visitor passes, and stay in the loop with what's happening around you.</p>"
@@ -967,6 +1006,8 @@ async def login(request: LoginRequest):
         login_rate_limit[email_key].append(now)
         raise HTTPException(status_code=401, detail="Invalid credentials")
     login_rate_limit.pop(email_key, None)
+    if not user.get("is_active", True):
+        raise HTTPException(status_code=403, detail="This account has been blocked by your estate admin.")
     if user["role"] == "admin" and not user.get("estate_id"):
         raise HTTPException(status_code=400, detail="Admin must be associated with an estate")
 
@@ -986,8 +1027,8 @@ async def login(request: LoginRequest):
         "timestamp": datetime.utcnow()
     })
 
-    token = create_access_token({"user_id": str(user["_id"]), "role": user["role"]})
-    user_dict = to_json_serializable({k: v for k, v in user.items() if k != "password"})
+    token = create_access_token({"user_id": str(user["_id"]), "role": user["role"], "tv": int(user.get("token_version", 0))})
+    user_dict = to_json_serializable({k: v for k, v in user.items() if k not in SENSITIVE_USER_FIELDS})
     user_dict["id"] = str(user["_id"])
     user_dict["estate_id"] = str(user["estate_id"]) if user.get("estate_id") else None
 
@@ -1050,7 +1091,7 @@ async def reset_password(request: ResetPasswordRequest):
     hashed = get_password_hash(request.new_password)
     users_collection.update_one(
         {"_id": user["_id"]},
-        {"$set": {"password": hashed}, "$unset": {"reset_token": "", "reset_token_expires": ""}}
+        {"$set": {"password": hashed}, "$unset": {"reset_token": "", "reset_token_expires": ""}, "$inc": {"token_version": 1}}
     )
 
     send_email(
@@ -1230,7 +1271,7 @@ async def join_waitlist(entry: WaitlistCreate, request: Request, background_task
 
 
 @app.post("/api/estates")
-async def create_estate(estate: EstateCreate, current_user: Dict = Depends(require_admin)):
+async def create_estate(estate: EstateCreate, current_user: Dict = Depends(require_super_admin)):
     try:
         estate_dict = estate.dict(exclude_unset=True)
         estate_dict["admin_id"] = ObjectId(current_user["_id"])
@@ -1294,7 +1335,10 @@ async def get_estate(estate_id: str, current_user: Dict = Depends(get_current_us
     is_member = current_user.get("estate_id") and str(current_user["estate_id"]) == estate_id
     if current_user["role"] != "super_admin" and not is_member:
         raise HTTPException(status_code=403, detail="Access denied")
-    return {"estate": to_json_serializable({**estate, "id": str(estate["_id"]), "admin_id": str(estate["admin_id"])})}
+    shown = {k: v for k, v in estate.items() if k != "finance"}
+    if current_user["role"] in ("admin", "super_admin"):
+        shown["finance"] = estate.get("finance")
+    return {"estate": to_json_serializable({**shown, "id": str(estate["_id"]), "admin_id": str(estate.get("admin_id"))})}
 
 
 @app.patch("/api/estates/{estate_id}")
@@ -1415,10 +1459,10 @@ async def create_visitor_pass(pass_data: VisitorPassCreate, current_user: Dict =
     result = passes_collection.insert_one(pass_dict)
     inserted_pass = passes_collection.find_one({"_id": result.inserted_id})
     try:
-        await sio.emit("new_visitor_pass", {
-            "visitor_pass": serialize_doc(inserted_pass),
-            "host": current_user["name"]
-        }, room=f"estate_{current_user['estate_id']}")
+        # Only staff and the host hear about a new pass, and never the code itself.
+        safe_pass = {k: v for k, v in serialize_doc(inserted_pass).items() if k not in ("qr_code", "code", "visitor_email")}
+        await sio.emit("new_visitor_pass", {"visitor_pass": safe_pass, "host": current_user["name"]},
+                       room=f"estate_{current_user['estate_id']}_staff")
     except Exception as e:
         logger.error(f"Failed to emit new_visitor_pass: {e}")
     # Only emails if a visitor_email was actually given — otherwise the
@@ -1491,11 +1535,11 @@ async def validate_visitor_pass(code: str, pass_data: VisitorPassValidate, curre
          "$unset": {"qr_code": ""}}  # the QR has served its purpose — free ~10KB per pass
     )
 
-    await sio.emit("visitor_entry", {
-        "visitor_pass": serialize_doc(pass_data_db),
-        "guard": current_user["name"],
-        "timestamp": now.isoformat()
-    }, room=f"estate_{current_user['estate_id']}")
+    _entry = {"visitor_pass": {k: v for k, v in serialize_doc(pass_data_db).items() if k not in ("qr_code", "code", "visitor_email")},
+              "guard": current_user["name"], "timestamp": now.isoformat()}
+    await sio.emit("visitor_entry", _entry, room=f"estate_{current_user['estate_id']}_staff")
+    if pass_data_db.get("host_id"):
+        await sio.emit("visitor_entry", _entry, room=f"user_{pass_data_db['host_id']}")
 
     audit_logs_collection.insert_one({
         "user_id": ObjectId(current_user["_id"]),
@@ -1519,6 +1563,7 @@ async def validate_visitor_pass(code: str, pass_data: VisitorPassValidate, curre
 
 @app.post("/api/incidents")
 async def create_incident(incident: IncidentCreate, background_tasks: BackgroundTasks, current_user: Dict = Depends(get_current_user)):
+    _rate_limit(f"incident:{current_user['_id']}", 10, 3600, "Too many incident reports in the last hour. For an emergency, use the panic button.")
     incident_dict = incident.dict(exclude_unset=True)
     incident_dict.update({
         "reporter_id": ObjectId(current_user["_id"]),
@@ -1618,7 +1663,10 @@ async def update_incident(incident_id: str, status: Optional[str] = None, assign
     if status:
         update_set["status"] = status
     if assigned_to:
-        update_set["assigned_to"] = ObjectId(assigned_to)
+        assignee = users_collection.find_one({"_id": ObjectId(assigned_to), "estate_id": ObjectId(current_user["estate_id"])}, {"_id": 1})
+        if not assignee:
+            raise HTTPException(status_code=400, detail="That person isn't in your estate")
+        update_set["assigned_to"] = assignee["_id"]
     if status in ["resolved", "closed"]:
         update_set["resolved_at"] = datetime.utcnow()
     update_ops = {"$set": update_set}
@@ -1705,10 +1753,9 @@ async def create_alert(alert: AlertCreate, background_tasks: BackgroundTasks, cu
         result = alerts_collection.insert_one(alert_dict)
         inserted_alert = alerts_collection.find_one({"_id": result.inserted_id})
 
-        await sio.emit("emergency_alert", {
-            "alert": serialize_doc(inserted_alert),
-            "sender": current_user.get("name", "Resident")
-        }, room=f"estate_{current_user['estate_id']}")
+        _ev = {"alert": serialize_doc(inserted_alert), "sender": current_user.get("name", "Resident")}
+        await sio.emit("emergency_alert", _ev, room=f"estate_{current_user['estate_id']}_staff")
+        await sio.emit("emergency_alert", _ev, room=f"user_{current_user['_id']}")
 
         # Phones first: a push notification (with vibration) to every guard
         # and admin, then a follow-up if nobody responds. Email below is
@@ -1796,10 +1843,10 @@ async def acknowledge_alert(alert_id: str, current_user: Dict = Depends(get_curr
             })
         except Exception as push_err:
             logger.warning(f"Ack push failed: {push_err}")
-    await sio.emit("alert_acknowledged", {
-        "alert": serialize_doc(updated_alert),
-        "acknowledged_by": {"name": current_user["name"], "role": current_user["role"]}
-    }, room=f"estate_{current_user['estate_id']}")
+    _ev = {"alert": serialize_doc(updated_alert), "acknowledged_by": {"name": current_user["name"], "role": current_user["role"]}}
+    await sio.emit("alert_acknowledged", _ev, room=f"estate_{current_user['estate_id']}_staff")
+    if alert.get("sender_id"):
+        await sio.emit("alert_acknowledged", _ev, room=f"user_{alert['sender_id']}")
     audit_logs_collection.insert_one({
         "user_id": ObjectId(current_user["_id"]),
         "estate_id": ObjectId(current_user["estate_id"]),
@@ -1833,10 +1880,10 @@ async def resolve_alert(alert_id: str, current_user: Dict = Depends(get_current_
         }}
     )
     updated_alert = alerts_collection.find_one({"_id": ObjectId(alert_id)})
-    await sio.emit("alert_resolved", {
-        "alert": serialize_doc(updated_alert),
-        "resolved_by": {"name": current_user["name"], "role": current_user["role"]}
-    }, room=f"estate_{current_user['estate_id']}")
+    _ev = {"alert": serialize_doc(updated_alert), "resolved_by": {"name": current_user["name"], "role": current_user["role"]}}
+    await sio.emit("alert_resolved", _ev, room=f"estate_{current_user['estate_id']}_staff")
+    if alert.get("sender_id"):
+        await sio.emit("alert_resolved", _ev, room=f"user_{alert['sender_id']}")
     audit_logs_collection.insert_one({
         "user_id": ObjectId(current_user["_id"]),
         "estate_id": ObjectId(current_user["estate_id"]),
@@ -1958,7 +2005,7 @@ async def police_integration(data: PoliceIntegration, current_user: Dict = Depen
 async def get_users(current_user: Dict = Depends(require_admin)):
     query_filter = {"estate_id": ObjectId(current_user["estate_id"]), "is_active": True}
     users = list(users_collection.find(query_filter).sort("created_at", -1))
-    return [serialize_doc({"id": str(u["_id"]), **{k: v for k, v in u.items() if k != "password"}}) for u in users]
+    return [serialize_doc({"id": str(u["_id"]), **{k: v for k, v in u.items() if k not in SENSITIVE_USER_FIELDS}}) for u in users]
 
 
 
@@ -2002,7 +2049,7 @@ async def update_user(user_id: str, role: Optional[str] = None, is_active: Optio
         "details": update_data,
         "timestamp": datetime.utcnow()
     })
-    return {"message": "User updated successfully", "user": to_json_serializable({**{k: v for k, v in user.items() if k != "password"}, **update_data, "id": user_id})}
+    return {"message": "User updated successfully", "user": to_json_serializable({**{k: v for k, v in user.items() if k not in SENSITIVE_USER_FIELDS}, **update_data, "id": user_id})}
 
 
 @app.patch("/api/users/{user_id}/role")
@@ -2074,6 +2121,7 @@ async def delete_user(user_id: str, current_user: Dict = Depends(require_admin))
 
 @app.post("/api/users/invite")
 async def single_invite(invite: UserInvite, current_user: Dict = Depends(require_admin)):
+    _rate_limit(f"invite:{current_user['estate_id']}", 60, 86400, "Too many invites today. Try again tomorrow.")
     """Admin-only single user invite.
 
     Admin invites are capped at 3 per estate — an estate should mostly be
@@ -2123,7 +2171,7 @@ async def single_invite(invite: UserInvite, current_user: Dict = Depends(require
         branded_email(
             "You've been invited",
             f"<p>Hi {html.escape(invite.name)},</p>"
-            f"<p>You've been added to <strong>{estate_name}</strong> on NexHood as a <strong>{invite.role}</strong>.</p>"
+            f"<p>You've been added to <strong>{html.escape(estate_name)}</strong> on NexHood as a <strong>{invite.role}</strong>.</p>"
             f"<p>Login email: {invite_email}<br>Temporary password: <strong>{temp_password}</strong></p>"
             f"<p style=\"margin:24px 0;\"><a href=\"{LOGIN_URL}\" "
             f"style=\"background:#1e2a5e;color:#ffffff;text-decoration:none;padding:12px 28px;"
@@ -2139,7 +2187,7 @@ async def single_invite(invite: UserInvite, current_user: Dict = Depends(require
         "action": "invite",
         "entity": "user",
         "entity_id": str(result.inserted_id),
-        "details": {k: v for k, v in user_dict.items() if k != "password"},
+        "details": {k: v for k, v in user_dict.items() if k not in SENSITIVE_USER_FIELDS},
         "timestamp": datetime.utcnow()
     })
 
@@ -2157,8 +2205,13 @@ async def single_invite(invite: UserInvite, current_user: Dict = Depends(require
 
 @app.post("/api/users/bulk-invite")
 async def bulk_invite_users(file: UploadFile = File(...), current_user: Dict = Depends(require_admin)):
-    content = await file.read()
-    csv_data = StringIO(content.decode("utf-8"))
+    _rate_limit(f"bulk:{current_user['estate_id']}", 5, 86400, "Too many bulk uploads today. Try again tomorrow.")
+    content = await file.read(512 * 1024 + 1)
+    if len(content) > 512 * 1024:
+        raise HTTPException(status_code=400, detail="That file is too big. Upload at most 200 people at a time.")
+    if content.count(b"\n") > 201:
+        raise HTTPException(status_code=400, detail="Upload at most 200 people at a time.")
+    csv_data = StringIO(content.decode("utf-8", errors="replace"))
     reader = csv.reader(csv_data)
     header = next(reader, None)
     if not header or len(header) < 4 or header[0].lower() != "name" or header[1].lower() != "email":
@@ -2227,7 +2280,7 @@ async def bulk_invite_users(file: UploadFile = File(...), current_user: Dict = D
                 branded_email(
                     "You've been invited",
                     f"<p>Hi {html.escape(name or '')},</p>"
-                    f"<p>You've been added to <strong>{estate_name}</strong> on NexHood as a <strong>{role or 'resident'}</strong>.</p>"
+                    f"<p>You've been added to <strong>{html.escape(estate_name)}</strong> on NexHood as a <strong>{role or 'resident'}</strong>.</p>"
                     f"<p>Login email: {email}<br>Temporary password: <strong>{temp_password}</strong></p>"
                     f"<p style=\"margin:24px 0;\"><a href=\"{LOGIN_URL}\" "
                     f"style=\"background:#1e2a5e;color:#ffffff;text-decoration:none;padding:12px 28px;"
@@ -2242,7 +2295,7 @@ async def bulk_invite_users(file: UploadFile = File(...), current_user: Dict = D
                 "action": "create",
                 "entity": "user",
                 "entity_id": str(result_id),
-                "details": {k: v for k, v in user_dict.items() if k != "password"},
+                "details": {k: v for k, v in user_dict.items() if k not in SENSITIVE_USER_FIELDS},
                 "timestamp": datetime.utcnow()
             })
         except Exception as e:
@@ -2875,8 +2928,17 @@ async def get_platform_stats(current_user: Dict = Depends(require_super_admin)):
 
 @app.post("/api/sync")
 async def sync_offline(actions: List[SyncAction], current_user: Dict = Depends(get_current_user)):
+    if len(actions) > 20:
+        raise HTTPException(status_code=400, detail="Too many offline actions at once (max 20)")
     results = []
     for action in actions:
+        # Never trust the phone's clock for when something happened in the
+        # future; offline items may be up to a day old.
+        now_srv = datetime.utcnow()
+        ts = action.timestamp.replace(tzinfo=None) if action.timestamp.tzinfo is None else (action.timestamp - action.timestamp.utcoffset()).replace(tzinfo=None)
+        if ts > now_srv or (now_srv - ts) > timedelta(hours=24):
+            ts = now_srv
+        action.timestamp = ts
         try:
             result = {"id": action.id}
             if action.type == "validate_visitor":
@@ -2889,6 +2951,9 @@ async def sync_offline(actions: List[SyncAction], current_user: Dict = Depends(g
                     "estate_id": ObjectId(current_user["estate_id"]),
                     "status": "active",
                 })
+                if pass_data and not (pass_data.get("valid_from") and pass_data["valid_from"] - timedelta(minutes=1) <= action.timestamp <= pass_data.get("valid_until", action.timestamp) + timedelta(minutes=1)):
+                    results.append({"id": action.id, "success": False, "error": "Pass was not valid at that time"})
+                    continue
                 if pass_data:
                     passes_collection.update_one(
                         {"_id": pass_data["_id"]},
@@ -2921,7 +2986,13 @@ async def sync_offline(actions: List[SyncAction], current_user: Dict = Depends(g
                     continue
                 alert_rate_limit[uid].append(now_ts)
                 alert_dict = AlertCreate(**action.data).dict(exclude_unset=True)
+                if alert_dict.get("type") == "drill":
+                    results.append({"id": action.id, "success": False, "error": "Test alerts can't be sent offline"})
+                    continue
                 alert_dict.update({
+                    "sender_apartment": _alert_location_label(current_user),
+                    "is_drill": False,
+                    "escalation_level": 0,
                     "sender_id": ObjectId(current_user["_id"]),
                     "sender_name": current_user.get("name", "Resident"),
                     "sender_phone": current_user.get("phone"),
@@ -2967,6 +3038,10 @@ async def get_visitor_passes(status: Optional[str] = None, start_date: Optional[
 
 @app.post("/api/community/posts")
 async def create_post(post: PostCreate, background_tasks: BackgroundTasks, current_user: Dict = Depends(get_current_user)):
+    _rate_limit(f"post:{current_user['_id']}", 10, 3600, "You've posted a lot in the last hour. Please wait a bit.")
+    if post.type == "event":
+        # Event posts email the whole estate; keep the email quota for emergencies.
+        _rate_limit(f"event:{current_user['_id']}", 3, 86400, "You can post up to 3 events a day.")
     post_dict = post.dict()
     post_dict.update({
         "author_id": ObjectId(current_user["_id"]),
@@ -3021,9 +3096,12 @@ async def reply_to_post(post_id: str, reply_data: dict, current_user: Dict = Dep
     post = posts_collection.find_one({"_id": ObjectId(post_id)})
     if not post or str(post.get("estate_id")) != str(current_user["estate_id"]):
         raise HTTPException(status_code=404, detail="Post not found")
-    content = (reply_data or {}).get("content", "").strip()
+    content = str((reply_data or {}).get("content", "")).strip()
     if not content:
         raise HTTPException(status_code=400, detail="Reply content is required")
+    if len(content) > 1000:
+        raise HTTPException(status_code=400, detail="Replies can be up to 1,000 characters")
+    _rate_limit(f"reply:{current_user['_id']}", 30, 3600)
     reply = {
         "author_id": ObjectId(current_user["_id"]),
         "author_name": current_user.get("name", "Resident"),
@@ -3216,7 +3294,7 @@ async def get_my_profile(current_user: Dict = Depends(get_current_user)):
     breaking (at minimum) password change. Renamed to fix that; keep this
     function's name different from the dependency above.
     """
-    user_data = serialize_doc({k: v for k, v in current_user.items() if k != "password"})
+    user_data = serialize_doc({k: v for k, v in current_user.items() if k not in SENSITIVE_USER_FIELDS})
     if current_user.get("estate_id"):
         estate = estates_collection.find_one({"_id": ObjectId(current_user["estate_id"])})
         if estate:
@@ -3231,12 +3309,14 @@ async def update_my_profile(update: ProfileUpdate, current_user: Dict = Depends(
     Changing email just updates the login address on this same account, no
     re-verification flow yet (matches how the rest of the app currently
     trusts email at signup)."""
-    changes = update.dict(exclude_unset=True, exclude_none=True)
+    changes = update.dict(exclude_unset=True, exclude_none=True, exclude={"current_password"})
     if not changes:
         raise HTTPException(status_code=400, detail="Nothing to update")
 
     if "email" in changes:
         changes["email"] = normalize_email(changes["email"])
+        if changes["email"] != current_user["email"].lower() and not verify_password(update.current_password or "", current_user["password"]):
+            raise HTTPException(status_code=400, detail="Enter your current password to change your email")
         if changes["email"] != current_user["email"].lower():
             dup_query = email_query(changes["email"])
             dup_query["_id"] = {"$ne": ObjectId(current_user["_id"])}
@@ -3246,7 +3326,7 @@ async def update_my_profile(update: ProfileUpdate, current_user: Dict = Depends(
     users_collection.update_one({"_id": ObjectId(current_user["_id"])}, {"$set": changes})
 
     updated = users_collection.find_one({"_id": ObjectId(current_user["_id"])})
-    user_data = serialize_doc({k: v for k, v in updated.items() if k != "password"})
+    user_data = serialize_doc({k: v for k, v in updated.items() if k not in SENSITIVE_USER_FIELDS})
     if updated.get("estate_id"):
         estate = estates_collection.find_one({"_id": ObjectId(updated["estate_id"])})
         if estate:
@@ -3279,8 +3359,11 @@ async def change_password(data: dict, current_user: Dict = Depends(get_current_u
     hashed_new = get_password_hash(data["new_password"])
     users_collection.update_one(
         {"_id": current_user["_id"]},
-        {"$set": {"password": hashed_new}}
+        {"$set": {"password": hashed_new}, "$inc": {"token_version": 1}}
     )
+    # Every other device is now logged out; this one gets a fresh token.
+    fresh_token = create_access_token({"user_id": str(current_user["_id"]), "role": current_user["role"],
+                                       "tv": int(current_user.get("token_version", 0)) + 1})
 
     # Security notification — lets the real owner know immediately if
     # someone else (or they themselves) just changed the password, so a
@@ -3300,7 +3383,7 @@ async def change_password(data: dict, current_user: Dict = Depends(get_current_u
         )
     )
 
-    return {"message": "Password changed successfully"}
+    return {"message": "Password changed successfully. Other devices have been logged out.", "token": fresh_token}
 
 
 # ===========================================================================
@@ -3790,6 +3873,7 @@ def _confirm_payment(payment: Dict, admin: Dict, background_tasks: Optional[Back
 
 @app.post("/api/payments")
 async def create_payment(body: PaymentCreate, background_tasks: BackgroundTasks, current_user: Dict = Depends(require_money_member)):
+    _rate_limit(f"payment:{current_user['_id']}", 15, 3600)
     """Resident: "I've paid" (bank transfer/cash) with a receipt photo. It
     waits for an admin to confirm the money arrived. Admin: records a
     payment they received for a unit; it's confirmed straight away."""
@@ -4162,6 +4246,7 @@ def _repair_out(r: Dict, me: Dict) -> Dict:
 
 @app.post("/api/repairs")
 async def create_repair(body: RepairCreate, background_tasks: BackgroundTasks, current_user: Dict = Depends(get_current_user)):
+    _rate_limit(f"repair:{current_user['_id']}", 10, 3600)
     estate_id = _estate_oid(current_user)
     doc = {**body.dict(), "image_count": len(body.images or []), "estate_id": estate_id, "status": "reported", "reporter_id": current_user["_id"],
            "reporter_name": current_user.get("name"), "reporter_unit": current_user.get("apartment"),
@@ -4680,7 +4765,7 @@ def _alert_location_label(user: Dict) -> Optional[str]:
     return apt or None
 
 
-def _push_to_users(user_filter: Dict, payload: Dict) -> int:
+def _push_to_users(user_filter: Dict, payload: Dict, errors: Optional[List[str]] = None) -> int:
     """Send one push to every saved phone/browser of the matching users.
     Dead subscriptions (uninstalled, permission revoked) are removed."""
     if not PUSH_ENABLED:
@@ -4696,12 +4781,21 @@ def _push_to_users(user_filter: Dict, payload: Dict) -> int:
                 sent += 1
             except WebPushException as e:
                 code = getattr(getattr(e, "response", None), "status_code", None)
+                body = (getattr(getattr(e, "response", None), "text", "") or "")[:200]
+                host = (sub.get("endpoint") or "").split("/")[2] if "//" in (sub.get("endpoint") or "") else "?"
                 if code in (404, 410):
                     users_collection.update_one({"_id": u["_id"]}, {"$pull": {"push_subscriptions": {"endpoint": sub.get("endpoint")}}})
+                    if errors is not None:
+                        errors.append(f"{host}: this device is no longer registered (turn alerts on again)")
                 else:
-                    logger.warning(f"Push failed ({code}): {e}")
+                    logger.error(f"PUSH FAILED {code} {host}: {body or e}")
+                    if errors is not None:
+                        errors.append(f"{host} refused the notification (code {code}). Tap Re-connect this phone.")
             except Exception as e:
-                logger.warning(f"Push failed: {e}")
+                logger.error(f"PUSH FAILED: {e}")
+                if errors is not None:
+                    errors.append("The notification could not be sent. Tap Re-connect this phone.")
+    logger.info(f"PUSH {payload.get('kind')} sent to {sent} device(s)")
     return sent
 
 
@@ -4722,8 +4816,12 @@ def _alert_push_payload(a: Dict, level: int) -> Dict:
 
 def _push_alert_to_staff(a: Dict, level: int = 0) -> int:
     roles = ["guard", "admin", "super_admin"] if level < 2 else ["guard", "admin", "super_admin", "police"]
-    return _push_to_users({"estate_id": a["estate_id"], "role": {"$in": roles}, "is_active": True, "_id": {"$ne": a.get("sender_id")}},
-                          _alert_push_payload(a, level))
+    who: Dict = {"estate_id": a["estate_id"], "role": {"$in": roles}, "is_active": True}
+    if not a.get("is_drill"):
+        # A real alert never rings the phone of the person who raised it.
+        # A test alert does, so an admin can check their own phone alone.
+        who["_id"] = {"$ne": a.get("sender_id")}
+    return _push_to_users(who, _alert_push_payload(a, level))
 
 
 async def _escalate_unanswered_alert(alert_id: ObjectId) -> None:
@@ -4737,7 +4835,7 @@ async def _escalate_unanswered_alert(alert_id: ObjectId) -> None:
                 return
             alerts_collection.update_one({"_id": alert_id}, {"$set": {"escalation_level": level, f"escalated_{level}_at": datetime.utcnow()}})
             await asyncio.to_thread(_push_alert_to_staff, a, level)
-            await sio.emit("alert_escalated", {"alert_id": str(alert_id), "level": level}, room=f"estate_{a['estate_id']}")
+            await sio.emit("alert_escalated", {"alert_id": str(alert_id), "level": level}, room=f"estate_{a['estate_id']}_staff")
             if level == 2 and not a.get("is_drill"):
                 admins = [u.get("email") for u in users_collection.find({"estate_id": a["estate_id"], "role": "admin", "is_active": True}, {"email": 1})]
                 notify_by_email([e for e in admins if e], "NexHood: alert still unanswered after 3 minutes",
@@ -4761,8 +4859,10 @@ async def push_public_key():
 
 @app.post("/api/push/subscribe")
 async def push_subscribe(body: PushSubscriptionBody, current_user: Dict = Depends(get_current_user)):
-    if not body.endpoint.startswith("https://"):
-        raise HTTPException(status_code=400, detail="Invalid subscription")
+    host = body.endpoint.split("/")[2] if body.endpoint.startswith("https://") and body.endpoint.count("/") >= 3 else ""
+    if not (host == "fcm.googleapis.com" or host.endswith(".push.apple.com") or host == "web.push.apple.com"
+            or host.endswith(".mozilla.com") or host.endswith(".notify.windows.com")):
+        raise HTTPException(status_code=400, detail="Unsupported push service")
     sub = {"endpoint": body.endpoint, "keys": {"p256dh": body.keys.get("p256dh", ""), "auth": body.keys.get("auth", "")}, "added_at": datetime.utcnow()}
     uid = ObjectId(current_user["_id"])
     users_collection.update_one({"_id": uid}, {"$pull": {"push_subscriptions": {"endpoint": body.endpoint}}})
@@ -4779,11 +4879,15 @@ async def push_unsubscribe(body: PushSubscriptionBody, current_user: Dict = Depe
 
 @app.post("/api/push/test")
 async def push_test(current_user: Dict = Depends(get_current_user)):
-    """Sends a test notification to this person's own devices."""
+    """Sends a test notification to this person's own devices, and reports
+    exactly what happened so a problem phone can be diagnosed."""
+    errors: List[str] = []
+    me = users_collection.find_one({"_id": ObjectId(current_user["_id"])}, {"push_subscriptions": 1}) or {}
+    devices = [(d.get("endpoint") or "").split("/")[2] for d in (me.get("push_subscriptions") or []) if "//" in (d.get("endpoint") or "")]
     n = await asyncio.to_thread(_push_to_users, {"_id": ObjectId(current_user["_id"])}, {
         "kind": "test", "title": "NexHood alerts are on", "body": "This is how an emergency will reach this phone.",
-        "url": "/app/alerts", "tag": "nexhood-test"})
-    return {"sent": n, "enabled": PUSH_ENABLED}
+        "url": "/app/alerts", "tag": "nexhood-test"}, errors)
+    return {"sent": n, "enabled": PUSH_ENABLED, "devices": devices, "errors": errors}
 
 
 @app.get("/api/alerts/active")
