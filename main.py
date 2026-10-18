@@ -16,7 +16,7 @@ import html  # escaping user text in outgoing emails
 import qrcode
 import pyotp
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 import asyncio, socketio
 import logging
 import base64
@@ -380,6 +380,9 @@ waitlist_rate_limit = defaultdict(list)
 register_rate_limit = defaultdict(list)
 police_rate_limit = defaultdict(list)
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "30"))
+# Version of the Terms of Service / Privacy Policy people must agree to.
+# Must match TERMS_VERSION in the frontend (src/lib/legal.ts).
+TERMS_VERSION = "2026-10-18"
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +404,8 @@ class UserCreate(BaseModel):
     estate_id: Optional[str] = None
     apartment: Optional[str] = None
     badges: List[BadgeAward] = []
+    accept_terms: bool = False
+    terms_version: Optional[str] = None
 
     @field_validator("phone")
     @classmethod
@@ -844,7 +849,7 @@ async def location_update(sid, data):
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-BUILD_VERSION = "v35-2026-10-14-security-darkmode"
+BUILD_VERSION = "v38-2026-10-18-onboarding"
 
 
 @app.get("/health")
@@ -866,6 +871,8 @@ async def register(user: UserCreate):
     endpoints below."""
     if user.role != "resident":
         raise HTTPException(status_code=400, detail="Only residents can register publicly.")
+    if not user.accept_terms:
+        raise HTTPException(status_code=400, detail="Please agree to the Terms of Service and Privacy Policy to create an account.")
 
     # Each registration creates a brand-new estate, so without a limit a
     # script could flood the database with junk estates.
@@ -922,8 +929,10 @@ async def register(user: UserCreate):
 
     hashed_password = get_password_hash(user.password)
 
-    user_dict = user.dict(exclude_unset=True, exclude={"badges"})
+    user_dict = user.dict(exclude_unset=True, exclude={"badges", "accept_terms", "terms_version"})
     user_dict.update({
+        "terms_accepted_version": TERMS_VERSION,
+        "terms_accepted_at": datetime.utcnow(),
         "badges": [],
         "email": normalize_email(user.email),
         "password": hashed_password,
@@ -973,7 +982,7 @@ async def register(user: UserCreate):
             f"<p>Your NexHood account is ready. "
             + (
                 f"Since you're the first person to register {html.escape(estate_name)}, you're now this estate's admin — "
-                f"you can invite guards, residents and police, and manage everything from the dashboard."
+                f"you can invite residents and guards, and manage everything from the dashboard."
                 if became_admin else
                 f"You're all set as a resident of {html.escape(estate_name)}."
             )
@@ -1026,6 +1035,10 @@ async def login(request: LoginRequest):
         "role": user["role"],
         "timestamp": datetime.utcnow()
     })
+    try:  # Privacy Policy: login records are kept 12 months.
+        login_logs_collection.delete_many({"user_id": user["_id"], "timestamp": {"$lt": datetime.utcnow() - timedelta(days=365)}})
+    except Exception:
+        pass
 
     token = create_access_token({"user_id": str(user["_id"]), "role": user["role"], "tv": int(user.get("token_version", 0))})
     user_dict = to_json_serializable({k: v for k, v in user.items() if k not in SENSITIVE_USER_FIELDS})
@@ -1425,8 +1438,8 @@ async def create_visitor_pass(pass_data: VisitorPassCreate, current_user: Dict =
     if vf > datetime.utcnow() + timedelta(days=30):
         raise HTTPException(status_code=400, detail="Passes can only be created up to 30 days ahead")
     # Lazy janitor: strip stored QR images from this estate's passes that expired
-    # over 7 days ago. Pass records (names, times, gates) are kept forever for
-    # history/analytics — only the heavy QR image is removed. Keeps the free
+    # over 7 days ago, and delete pass records more than 12 months old
+    # (the retention period promised in the Privacy Policy). Keeps the free
     # 512MB database self-cleaning without any cron job.
     try:
         passes_collection.update_many(
@@ -1435,6 +1448,9 @@ async def create_visitor_pass(pass_data: VisitorPassCreate, current_user: Dict =
              "qr_code": {"$exists": True}},
             {"$unset": {"qr_code": ""}}
         )
+        # Privacy Policy: visitor details are kept 12 months after the visit.
+        passes_collection.delete_many({"estate_id": ObjectId(current_user["estate_id"]),
+                                       "valid_until": {"$lt": datetime.utcnow() - timedelta(days=365)}})
     except Exception as cleanup_err:
         logger.warning(f"QR cleanup skipped: {cleanup_err}")
     code = generate_visitor_code()
@@ -1865,20 +1881,35 @@ async def resolve_alert(alert_id: str, current_user: Dict = Depends(get_current_
     active -> acknowledged and then sat there forever — there was no way
     to mark one actually handled, so the dashboard's "active alerts" count
     would only ever grow. Guards and admins can resolve."""
-    if current_user["role"] not in ["guard", "admin", "super_admin"]:
-        raise HTTPException(status_code=403, detail="Unauthorized")
     alert = alerts_collection.find_one({"_id": ObjectId(alert_id)})
     if not alert or str(alert["estate_id"]) != str(current_user["estate_id"]):
         raise HTTPException(status_code=404, detail="Alert not found")
+    is_staff = current_user["role"] in ["guard", "admin", "super_admin"]
+    # The person who raised it can call it off ("I'm safe" / pressed by mistake),
+    # which also stops the 1- and 3-minute escalations.
+    by_sender = str(alert.get("sender_id")) == str(current_user["_id"])
+    if not is_staff and not by_sender:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    if alert.get("status") == "resolved":
+        return {"message": "Alert already closed", "alert": serialize_doc(alert)}
+    cancelled = by_sender and not is_staff
 
     alerts_collection.update_one(
         {"_id": ObjectId(alert_id)},
         {"$set": {
             "status": "resolved",
             "resolved_at": datetime.utcnow(),
-            "resolved_by": ObjectId(current_user["_id"])
+            "resolved_by": ObjectId(current_user["_id"]),
+            "cancelled_by_sender": cancelled,
         }}
     )
+    if cancelled:
+        where = alert.get("sender_apartment") or "their house"
+        asyncio.create_task(asyncio.to_thread(_push_to_users,
+            {"estate_id": alert["estate_id"], "role": {"$in": ["guard", "admin", "super_admin"]}, "is_active": True},
+            {"kind": "cancel", "title": f"✅ Alert called off · {where}",
+             "body": f"{current_user.get('name', 'The resident')} says they are safe and cancelled the alert.",
+             "url": "/app/alerts", "tag": f"alert-{alert['_id']}"}))
     updated_alert = alerts_collection.find_one({"_id": ObjectId(alert_id)})
     _ev = {"alert": serialize_doc(updated_alert), "resolved_by": {"name": current_user["name"], "role": current_user["role"]}}
     await sio.emit("alert_resolved", _ev, room=f"estate_{current_user['estate_id']}_staff")
@@ -2121,6 +2152,7 @@ async def delete_user(user_id: str, current_user: Dict = Depends(require_admin))
 
 @app.post("/api/users/invite")
 async def single_invite(invite: UserInvite, current_user: Dict = Depends(require_admin)):
+    _require_plan_ok(current_user)
     _rate_limit(f"invite:{current_user['estate_id']}", 60, 86400, "Too many invites today. Try again tomorrow.")
     """Admin-only single user invite.
 
@@ -2205,17 +2237,22 @@ async def single_invite(invite: UserInvite, current_user: Dict = Depends(require
 
 @app.post("/api/users/bulk-invite")
 async def bulk_invite_users(file: UploadFile = File(...), current_user: Dict = Depends(require_admin)):
+    _require_plan_ok(current_user)
     _rate_limit(f"bulk:{current_user['estate_id']}", 5, 86400, "Too many bulk uploads today. Try again tomorrow.")
     content = await file.read(512 * 1024 + 1)
     if len(content) > 512 * 1024:
         raise HTTPException(status_code=400, detail="That file is too big. Upload at most 200 people at a time.")
     if content.count(b"\n") > 201:
         raise HTTPException(status_code=400, detail="Upload at most 200 people at a time.")
-    csv_data = StringIO(content.decode("utf-8", errors="replace"))
-    reader = csv.reader(csv_data)
-    header = next(reader, None)
-    if not header or len(header) < 4 or header[0].lower() != "name" or header[1].lower() != "email":
-        raise HTTPException(status_code=400, detail="Invalid CSV format. Expected headers: name, email, phone, role, apartment")
+    # Excel adds an invisible BOM at the start of "CSV UTF-8" files, and some
+    # laptops save CSVs with semicolons. Both used to fail as "Invalid CSV".
+    text = content.decode("utf-8-sig", errors="replace")
+    first_line = text.split("\n", 1)[0]
+    delimiter = ";" if first_line.count(";") > first_line.count(",") else ","
+    reader = csv.reader(StringIO(text), delimiter=delimiter)
+    header = [h.strip().lower() for h in (next(reader, None) or [])]
+    if len(header) < 4 or header[0] != "name" or header[1] != "email":
+        raise HTTPException(status_code=400, detail="Invalid CSV format. The first row must be: name, email, phone, role, apartment")
     results = []
     # Track admin count locally so a CSV with several "admin" rows can't
     # blow past the 3-per-estate cap within a single upload.
@@ -2229,8 +2266,11 @@ async def bulk_invite_users(file: UploadFile = File(...), current_user: Dict = D
     for row in reader:
         if not row or not row[0].strip():
             continue
-        name, email, phone, role, apartment = [field.strip() for field in row[:5]] + [None] * (5 - len(row))
-        email = normalize_email(email)
+        name, email, phone, role, apartment = ([field.strip() for field in row[:5]] + [None] * 5)[:5]
+        email = normalize_email(email or "")
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            results.append({"email": email or "(blank)", "status": "skipped", "reason": f"Missing or invalid email for {name}"})
+            continue
         role = (role or "resident").lower()
         # SECURITY: this used to accept ANY role string from the CSV —
         # including "super_admin" — so any estate admin (and anyone can
@@ -3302,6 +3342,21 @@ async def get_my_profile(current_user: Dict = Depends(get_current_user)):
     return user_data
 
 
+class AcceptTermsBody(BaseModel):
+    version: str = Field(..., max_length=20)
+
+
+@app.post("/api/users/me/accept-terms")
+async def accept_terms(body: AcceptTermsBody, current_user: Dict = Depends(get_current_user)):
+    """Records that this person agreed to the current Terms and Privacy Policy
+    (date and version), which is the evidence of consent the NDPA expects."""
+    if body.version != TERMS_VERSION:
+        raise HTTPException(status_code=400, detail="Please refresh the page to see the latest terms.")
+    users_collection.update_one({"_id": ObjectId(current_user["_id"])}, {"$set": {
+        "terms_accepted_version": TERMS_VERSION, "terms_accepted_at": datetime.utcnow()}})
+    return await get_my_profile(users_collection.find_one({"_id": ObjectId(current_user["_id"])}))
+
+
 @app.patch("/api/users/me")
 async def update_my_profile(update: ProfileUpdate, current_user: Dict = Depends(get_current_user)):
     """Self-serve profile edits — name, phone, email, apartment. Nothing
@@ -3731,6 +3786,7 @@ async def update_charge(charge_id: str, body: ChargeUpdate, current_user: Dict =
 
 @app.post("/api/charges/{charge_id}/issue")
 async def issue_bills(charge_id: str, body: IssueBills, background_tasks: BackgroundTasks, current_user: Dict = Depends(require_admin)):
+    _require_plan_ok(current_user)
     """Create one bill per unit for this charge and period. Safe to run
     twice: units that already have this bill for this period are skipped.
     Any estate-balance credit a unit has is used up first."""
@@ -4566,6 +4622,258 @@ async def paystack_webhook(request: Request, background_tasks: BackgroundTasks):
                 await asyncio.to_thread(_settle_paystack, ref, background_tasks)
             except HTTPException as e:
                 logger.error(f"Webhook settle failed for {ref}: {e.detail}")
+        elif ref and ref.startswith("NXP-"):
+            try:
+                await asyncio.to_thread(_settle_plan_payment, ref)
+            except HTTPException as e:
+                logger.error(f"Webhook plan settle failed for {ref}: {e.detail}")
+    return {"ok": True}
+
+
+# ===========================================================================
+# NEXHOOD PLAN BILLING: what an ESTATE pays NexHood (not residents' bills).
+#
+# - Prepaid in blocks of 3, 6 or 12 months (3 months is the minimum).
+# - Paid online with Paystack (card, bank transfer, USSD) into NexHood's own
+#   Paystack balance, or recorded by the super admin after a bank transfer.
+# - When a plan ends there are 7 days of grace, then growth features
+#   (inviting people, sending bills) pause. Panic alerts, visitor passes and
+#   incidents NEVER stop: an estate's safety is never held hostage to billing.
+# ===========================================================================
+plan_payments_collection = db["plan_payments"]
+
+# Monthly price by number of houses. Edit these to change pricing.
+PLAN_TIERS = [
+    {"key": "small", "label": "Up to 50 houses", "max_houses": 50, "monthly": int(os.getenv("PLAN_PRICE_SMALL", "35000"))},
+    {"key": "medium", "label": "51 to 150 houses", "max_houses": 150, "monthly": int(os.getenv("PLAN_PRICE_MEDIUM", "60000"))},
+    {"key": "large", "label": "151 to 300 houses", "max_houses": 300, "monthly": int(os.getenv("PLAN_PRICE_LARGE", "95000"))},
+]
+# months -> percent off. 12 months = pay for 10, get 12.
+PLAN_PERIODS = {3: 0, 6: 5, 12: 17}
+PLAN_GRACE_DAYS = 7
+FOUNDING_DISCOUNT_PERCENT = int(os.getenv("FOUNDING_DISCOUNT_PERCENT", "0"))
+BILLING_CONTACT = os.getenv("BILLING_CONTACT", "fasoro@nexhoodapp.com")
+
+
+def _estate_houses(estate_id: ObjectId) -> int:
+    n = units_collection.count_documents({"estate_id": estate_id})
+    if n:
+        return n
+    return users_collection.count_documents({"estate_id": estate_id, "role": "resident", "is_active": {"$ne": False}})
+
+
+def _plan_tier(houses: int) -> Optional[Dict]:
+    for t in PLAN_TIERS:
+        if houses <= t["max_houses"]:
+            return t
+    return None  # bigger than our largest tier: custom quote
+
+
+def _plan_price(monthly: int, months: int, founding: int = 0) -> int:
+    off = PLAN_PERIODS[months] + founding
+    total = monthly * months * (100 - off) / 100
+    return int(round(total / 100.0) * 100)  # round to the nearest N100
+
+
+def _subscription(estate: Dict) -> Dict:
+    """Current plan state. Estates created before billing existed get a
+    fresh trial the first time this runs, so nobody is locked out by surprise."""
+    sub = dict(estate.get("subscription") or {})
+    if not sub.get("trial_ends_at") and not sub.get("paid_until"):
+        sub = {"plan": "trial", "status": "trialing", "trial_ends_at": datetime.utcnow() + timedelta(days=TRIAL_DAYS)}
+        estates_collection.update_one({"_id": estate["_id"]}, {"$set": {"subscription": sub}})
+    now = datetime.utcnow()
+    paid_until = sub.get("paid_until")
+    trial_end = sub.get("trial_ends_at")
+    if paid_until and now < paid_until:
+        status, ends = "active", paid_until
+    elif not paid_until and trial_end and now < trial_end:
+        status, ends = "trialing", trial_end
+    else:
+        ends = paid_until or trial_end or now
+        status = "grace" if now < ends + timedelta(days=PLAN_GRACE_DAYS) else "lapsed"
+    days_left = (ends - now).days if ends > now else 0
+    return {**sub, "status": status, "ends_at": ends, "days_left": days_left,
+            "grace_ends_at": ends + timedelta(days=PLAN_GRACE_DAYS)}
+
+
+def _require_plan_ok(current_user: Dict) -> None:
+    if current_user.get("role") == "super_admin":
+        return
+    estate = estates_collection.find_one({"_id": _estate_oid(current_user)})
+    if estate and _subscription(estate)["status"] == "lapsed":
+        raise HTTPException(status_code=402, detail="Your estate's NexHood plan has ended. Renew it in Plan & billing to keep inviting people and sending bills. Alerts and visitor passes still work.")
+
+
+def _plan_summary(estate: Dict) -> Dict:
+    houses = _estate_houses(estate["_id"])
+    tier = _plan_tier(houses)
+    founding = FOUNDING_DISCOUNT_PERCENT if estate.get("founding_estate") else 0
+    options = []
+    if tier:
+        for months, off in PLAN_PERIODS.items():
+            total = _plan_price(tier["monthly"], months, founding)
+            options.append({"months": months, "total": total, "per_month": int(round(total / months)),
+                            "percent_off": off + founding, "saving": tier["monthly"] * months - total})
+    sub = _subscription(estate)
+    return {
+        "subscription": {k: (v.isoformat() + "Z" if isinstance(v, datetime) else v) for k, v in sub.items()},
+        "houses": houses, "tier": tier, "tiers": PLAN_TIERS, "options": options,
+        "custom_quote": tier is None, "online": PAYSTACK_ENABLED, "contact": BILLING_CONTACT,
+        "grace_days": PLAN_GRACE_DAYS, "founding_percent": founding,
+    }
+
+
+@app.get("/api/billing/status")
+async def billing_status(current_user: Dict = Depends(get_current_user)):
+    """Small summary any member can read (the admin banner uses it)."""
+    estate = estates_collection.find_one({"_id": _estate_oid(current_user)})
+    if not estate:
+        raise HTTPException(status_code=404, detail="Estate not found")
+    sub = _subscription(estate)
+    return {"status": sub["status"], "days_left": sub["days_left"], "ends_at": sub["ends_at"].isoformat() + "Z"}
+
+
+@app.get("/api/billing")
+async def billing_overview(current_user: Dict = Depends(require_admin)):
+    estate = estates_collection.find_one({"_id": _estate_oid(current_user)})
+    if not estate:
+        raise HTTPException(status_code=404, detail="Estate not found")
+    out = _plan_summary(estate)
+    history = plan_payments_collection.find({"estate_id": estate["_id"], "status": "paid"}).sort("paid_at", -1).limit(24)
+    out["history"] = [{"id": str(p["_id"]), "months": p["months"], "amount": p["amount"], "method": p.get("method"),
+                       "paid_at": p["paid_at"].isoformat() + "Z", "period_start": p["period_start"].isoformat() + "Z",
+                       "period_end": p["period_end"].isoformat() + "Z", "reference": p.get("reference")} for p in history]
+    return out
+
+
+class PlanPayBody(BaseModel):
+    months: int
+
+
+@app.post("/api/billing/pay")
+async def billing_pay(body: PlanPayBody, current_user: Dict = Depends(require_admin)):
+    if body.months not in PLAN_PERIODS:
+        raise HTTPException(status_code=400, detail="Choose 3, 6 or 12 months")
+    _rate_limit(f"planpay:{current_user['_id']}", 10, 3600, "Too many attempts. Please wait a bit and try again.")
+    estate = estates_collection.find_one({"_id": _estate_oid(current_user)})
+    summary = _plan_summary(estate)
+    option = next((o for o in summary["options"] if o["months"] == body.months), None)
+    if not option:
+        raise HTTPException(status_code=400, detail=f"Your estate needs a custom quote. Contact {BILLING_CONTACT}.")
+    reference = f"NXP-{secrets.token_hex(8)}"
+    plan_payments_collection.insert_one({
+        "estate_id": estate["_id"], "user_id": ObjectId(current_user["_id"]), "months": body.months,
+        "amount": option["total"], "houses": summary["houses"], "tier": summary["tier"]["key"],
+        "method": "paystack", "reference": reference, "status": "initiated", "created_at": datetime.utcnow(),
+    })
+    data = await asyncio.to_thread(_paystack, "POST", "/transaction/initialize", {
+        "email": current_user["email"], "amount": option["total"] * 100, "reference": reference,
+        "channels": ["card", "bank_transfer", "ussd", "bank"],
+        "callback_url": f"{FRONTEND_URL}/app/billing?reference={reference}",
+        "metadata": {"kind": "nexhood_plan", "estate_id": str(estate["_id"]), "months": body.months,
+                     "custom_fields": [{"display_name": "Estate", "variable_name": "estate", "value": estate.get("name", "")},
+                                       {"display_name": "Plan", "variable_name": "plan", "value": f"{body.months} months"}]},
+    })
+    return {"authorization_url": (data.get("data") or {}).get("authorization_url"), "reference": reference}
+
+
+def _extend_plan(estate_id: ObjectId, months: int) -> Tuple[datetime, datetime]:
+    estate = estates_collection.find_one({"_id": estate_id}) or {}
+    sub = estate.get("subscription") or {}
+    now = datetime.utcnow()
+    # Paying early never wastes days: the new period starts when the current one ends.
+    start = max([d for d in (now, sub.get("paid_until"), sub.get("trial_ends_at")) if d])
+    end = start + timedelta(days=30 * months + (months // 12) * 5)  # 12 months = 365 days
+    estates_collection.update_one({"_id": estate_id}, {"$set": {
+        "subscription.paid_until": end, "subscription.plan": "paid", "subscription.status": "active",
+        "subscription.last_payment_at": now}})
+    return start, end
+
+
+def _settle_plan_payment(reference: str) -> Dict:
+    pay = plan_payments_collection.find_one({"reference": reference})
+    if not pay:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    if pay["status"] == "paid":
+        return {"status": "paid", "already": True}
+    data = (_paystack("GET", f"/transaction/verify/{urllib.parse.quote(reference)}").get("data") or {})
+    if data.get("status") != "success":
+        return {"status": data.get("status") or "pending"}
+    if int(data.get("amount") or 0) < pay["amount"] * 100 or (data.get("currency") or "NGN") != "NGN":
+        plan_payments_collection.update_one({"_id": pay["_id"]}, {"$set": {"status": "failed", "paystack_status": "amount_mismatch"}})
+        raise HTTPException(status_code=400, detail="Amount paid doesn't match the plan price")
+    # Claim it atomically so the webhook and the browser can't both extend the plan.
+    claimed = plan_payments_collection.find_one_and_update({"_id": pay["_id"], "status": "initiated"}, {"$set": {"status": "settling"}})
+    if not claimed:
+        return {"status": "paid", "already": True}
+    start, end = _extend_plan(pay["estate_id"], pay["months"])
+    plan_payments_collection.update_one({"_id": pay["_id"]}, {"$set": {
+        "status": "paid", "paid_at": datetime.utcnow(), "period_start": start, "period_end": end, "channel": data.get("channel")}})
+    audit_logs_collection.insert_one({"user_id": pay.get("user_id"), "estate_id": pay["estate_id"], "action": "plan_paid",
+                                      "entity": "billing", "details": {"months": pay["months"], "amount": pay["amount"]}, "timestamp": datetime.utcnow()})
+    return {"status": "paid", "paid_until": end.isoformat() + "Z"}
+
+
+@app.get("/api/billing/verify")
+async def billing_verify(reference: str, current_user: Dict = Depends(require_admin)):
+    pay = plan_payments_collection.find_one({"reference": reference})
+    if not pay or pay["estate_id"] != _estate_oid(current_user):
+        raise HTTPException(status_code=404, detail="Payment not found")
+    return await asyncio.to_thread(_settle_plan_payment, reference)
+
+
+# --- Super admin (you): see every estate's plan, record bank transfers ------
+@app.get("/api/admin/billing/estates")
+async def admin_billing_estates(current_user: Dict = Depends(require_super_admin)):
+    rows = []
+    for e in estates_collection.find({}, {"name": 1, "subscription": 1, "founding_estate": 1}):
+        sub = _subscription(e)
+        rows.append({"estate_id": str(e["_id"]), "name": e.get("name"), "status": sub["status"], "days_left": sub["days_left"],
+                     "ends_at": sub["ends_at"].isoformat() + "Z", "houses": _estate_houses(e["_id"]), "founding": bool(e.get("founding_estate"))})
+    return rows
+
+
+class RecordPlanPayment(BaseModel):
+    estate_id: str
+    months: int
+    amount: int = Field(..., ge=0, le=50_000_000)
+    note: Optional[str] = Field(None, max_length=300)
+
+
+@app.post("/api/admin/billing/record")
+async def admin_record_plan_payment(body: RecordPlanPayment, current_user: Dict = Depends(require_super_admin)):
+    """Use this when an estate pays NexHood by bank transfer outside Paystack."""
+    if body.months not in (1, 3, 6, 12):
+        raise HTTPException(status_code=400, detail="Months must be 1, 3, 6 or 12")
+    eid = ObjectId(body.estate_id)
+    if not estates_collection.find_one({"_id": eid}):
+        raise HTTPException(status_code=404, detail="Estate not found")
+    start, end = _extend_plan(eid, body.months)
+    plan_payments_collection.insert_one({"estate_id": eid, "user_id": ObjectId(current_user["_id"]), "months": body.months,
+                                         "amount": body.amount, "method": "bank_transfer", "note": body.note, "status": "paid",
+                                         "reference": f"MANUAL-{secrets.token_hex(4)}", "created_at": datetime.utcnow(),
+                                         "paid_at": datetime.utcnow(), "period_start": start, "period_end": end})
+    return {"ok": True, "paid_until": end.isoformat() + "Z"}
+
+
+class SetTrialBody(BaseModel):
+    estate_id: str
+    trial_days: int = Field(..., ge=0, le=180)
+    founding_estate: Optional[bool] = None
+
+
+@app.post("/api/admin/billing/trial")
+async def admin_set_trial(body: SetTrialBody, current_user: Dict = Depends(require_super_admin)):
+    """Set how many days of free trial an estate has left from today
+    (0 = trial over now), and optionally mark it as a founding estate."""
+    eid = ObjectId(body.estate_id)
+    update: Dict = {"subscription.trial_ends_at": datetime.utcnow() + timedelta(days=body.trial_days)}
+    if body.founding_estate is not None:
+        update["founding_estate"] = body.founding_estate
+    res = estates_collection.update_one({"_id": eid}, {"$set": update})
+    if not res.matched_count:
+        raise HTTPException(status_code=404, detail="Estate not found")
     return {"ok": True}
 
 
