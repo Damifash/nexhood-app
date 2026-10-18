@@ -849,7 +849,7 @@ async def location_update(sid, data):
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-BUILD_VERSION = "v38-2026-10-18-onboarding"
+BUILD_VERSION = "v39-2026-10-18-bill-one-house"
 
 
 @app.get("/health")
@@ -3874,9 +3874,72 @@ async def void_invoice(invoice_id: str, current_user: Dict = Depends(require_adm
     if not inv:
         raise HTTPException(status_code=404, detail="Bill not found")
     if int(inv.get("amount_paid", 0)) > 0:
-        raise HTTPException(status_code=400, detail="This bill already has payments on it. Record a refund instead of cancelling.")
+        raise HTTPException(status_code=400, detail="This bill already has money paid against it, so it can't be cancelled. If it was wrong, settle the difference with the resident (any extra they paid stays as their estate balance).")
     invoices_collection.update_one({"_id": inv["_id"]}, {"$set": {"status": "void", "voided_by": current_user["_id"], "voided_at": datetime.utcnow()}})
     return {"message": "Bill cancelled"}
+
+
+class SingleBill(BaseModel):
+    unit_id: str
+    title: str = Field(..., min_length=2, max_length=80)
+    amount: int = Field(..., gt=0, le=100_000_000)
+    due_date: datetime
+    category: str = "other"
+    note: Optional[str] = Field(None, max_length=300)
+
+    @field_validator("category")
+    @classmethod
+    def _cat(cls, v):
+        if v not in CHARGE_CATEGORIES:
+            raise ValueError("Unknown bill category")
+        return v
+
+
+@app.post("/api/invoices")
+async def create_single_bill(body: SingleBill, background_tasks: BackgroundTasks, current_user: Dict = Depends(require_admin)):
+    """A one-off bill for ONE house, with its own title and amount (a fine,
+    a damaged gate, a new gate remote, a past balance). It works exactly like
+    any other bill: the resident sees it, pays it, and it shows in arrears."""
+    _require_plan_ok(current_user)
+    _rate_limit(f"single-bill:{current_user['_id']}", 100, 3600, "Too many bills in an hour. Please wait a little.")
+    estate_id = _estate_oid(current_user)
+    unit = units_collection.find_one({"_id": _oid(body.unit_id, "house"), "estate_id": estate_id})
+    if not unit:
+        raise HTTPException(status_code=404, detail="House not found")
+    due = body.due_date
+    if due.tzinfo is not None:
+        due = (due - due.utcoffset()).replace(tzinfo=None)
+    title = body.title.strip()
+    inv = {"estate_id": estate_id, "unit_id": unit["_id"], "unit_label": unit["label"], "charge_id": None,
+           "title": title, "category": body.category, "period": "one-off", "note": (body.note or "").strip() or None,
+           "amount": int(body.amount), "amount_paid": 0, "status": "unpaid", "due_date": due,
+           "created_by": current_user["_id"], "created_at": datetime.utcnow()}
+    res = invoices_collection.insert_one(inv)
+    credit = int(unit.get("credit", 0))
+    if credit > 0:
+        use = min(credit, int(body.amount))
+        units_collection.update_one({"_id": unit["_id"]}, {"$inc": {"credit": -use}})
+        invoices_collection.update_one({"_id": res.inserted_id}, {"$set": {
+            "amount_paid": use, "status": "paid" if use >= body.amount else "part_paid", "paid_from_credit": use,
+            **({"paid_at": datetime.utcnow()} if use >= body.amount else {})}})
+    audit_logs_collection.insert_one({"user_id": current_user["_id"], "estate_id": estate_id, "action": "single_bill", "entity": "invoice",
+                                      "entity_id": str(res.inserted_id), "details": {"title": title, "amount": int(body.amount), "unit": unit["label"]},
+                                      "timestamp": datetime.utcnow()})
+    emails = _unit_payer_emails(unit)
+    if emails:
+        fin = _finance_settings(estate_id)
+        bank = (f"<p>Pay by bank transfer to <strong>{html.escape(fin.get('account_name') or '')}</strong>, "
+                f"{html.escape(fin.get('bank_name') or '')} {html.escape(fin.get('account_number') or '')}, then tap "
+                f"“I’ve paid” in NexHood and attach your receipt.</p>") if fin.get("account_number") else ""
+        note = f"<p>{html.escape(inv['note'])}</p>" if inv.get("note") else ""
+        background_tasks.add_task(notify_by_email, emails, f"New bill: {title}", branded_email(
+            "You have a new estate bill",
+            f"<p><strong>{html.escape(title)}</strong> for {html.escape(unit['label'])}: ₦{int(body.amount):,}, due by {due.strftime('%d %b %Y')}.</p>"
+            f"{note}{bank}"
+            f"<p style='margin:20px 0;'><a href=\"{FRONTEND_URL}/app/payments\" style=\"background:#1e2a5e;color:#ffffff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:600;display:inline-block;\">View my bills</a></p>"))
+    out = serialize_doc(invoices_collection.find_one({"_id": res.inserted_id}))
+    out["emailed"] = len(emails)
+    return out
 
 
 # ---------------- payments ----------------
