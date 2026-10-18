@@ -435,6 +435,10 @@ class UserResponse(BaseModel):
     last_seen: datetime
     created_at: datetime
     badges: List[BadgeAward]
+    # Sent at login so the app doesn't flash the "agree to terms" box for a
+    # second before it finds out the person already agreed.
+    terms_accepted_version: Optional[str] = None
+    must_change_password: bool = False
 
     class Config:
         from_attributes = True
@@ -849,7 +853,7 @@ async def location_update(sid, data):
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-BUILD_VERSION = "v39-2026-10-18-bill-one-house"
+BUILD_VERSION = "v40-2026-10-19-first-login"
 
 
 @app.get("/health")
@@ -1104,7 +1108,7 @@ async def reset_password(request: ResetPasswordRequest):
     hashed = get_password_hash(request.new_password)
     users_collection.update_one(
         {"_id": user["_id"]},
-        {"$set": {"password": hashed}, "$unset": {"reset_token": "", "reset_token_expires": ""}, "$inc": {"token_version": 1}}
+        {"$set": {"password": hashed, "must_change_password": False}, "$unset": {"reset_token": "", "reset_token_expires": ""}, "$inc": {"token_version": 1}}
     )
 
     send_email(
@@ -2188,7 +2192,8 @@ async def single_invite(invite: UserInvite, current_user: Dict = Depends(require
         "last_seen": datetime.utcnow(),
         "created_at": datetime.utcnow(),
         "device_tokens": [],
-        "badges": []
+        "badges": [],
+        "must_change_password": True,
     }
 
     result = users_collection.insert_one(user_dict)
@@ -2209,7 +2214,7 @@ async def single_invite(invite: UserInvite, current_user: Dict = Depends(require
             f"style=\"background:#1e2a5e;color:#ffffff;text-decoration:none;padding:12px 28px;"
             f"border-radius:8px;font-weight:700;display:inline-block;\">Log in to NexHood</a></p>"
             f"<p style=\"color:#6b7280;font-size:13px;\">Or copy this link into your browser: {LOGIN_URL}</p>"
-            f"<p>Please log in and change your password from Settings once you're in.</p>"
+            f"<p>When you first log in, you'll be asked to choose your own password. Then add NexHood to your phone's home screen so it opens like an app.</p>"
         )
     )
 
@@ -2306,7 +2311,8 @@ async def bulk_invite_users(file: UploadFile = File(...), current_user: Dict = D
                 "is_active": True,
                 "last_seen": datetime.utcnow(),
                 "created_at": datetime.utcnow(),
-                "device_tokens": []
+                "device_tokens": [],
+                "must_change_password": True,
             }
             result_id = users_collection.insert_one(user_dict).inserted_id
             results.append({
@@ -2326,7 +2332,7 @@ async def bulk_invite_users(file: UploadFile = File(...), current_user: Dict = D
                     f"style=\"background:#1e2a5e;color:#ffffff;text-decoration:none;padding:12px 28px;"
                     f"border-radius:8px;font-weight:700;display:inline-block;\">Log in to NexHood</a></p>"
                     f"<p style=\"color:#6b7280;font-size:13px;\">Or copy this link into your browser: {LOGIN_URL}</p>"
-                    f"<p>Please log in and change your password from Settings once you're in.</p>"
+                    f"<p>When you first log in, you'll be asked to choose your own password. Then add NexHood to your phone's home screen so it opens like an app.</p>"
                 )
             )
             audit_logs_collection.insert_one({
@@ -3414,7 +3420,7 @@ async def change_password(data: dict, current_user: Dict = Depends(get_current_u
     hashed_new = get_password_hash(data["new_password"])
     users_collection.update_one(
         {"_id": current_user["_id"]},
-        {"$set": {"password": hashed_new}, "$inc": {"token_version": 1}}
+        {"$set": {"password": hashed_new, "must_change_password": False}, "$inc": {"token_version": 1}}
     )
     # Every other device is now logged out; this one gets a fresh token.
     fresh_token = create_access_token({"user_id": str(current_user["_id"]), "role": current_user["role"],
@@ -5236,6 +5242,11 @@ async def push_subscribe(body: PushSubscriptionBody, current_user: Dict = Depend
         raise HTTPException(status_code=400, detail="Unsupported push service")
     sub = {"endpoint": body.endpoint, "keys": {"p256dh": body.keys.get("p256dh", ""), "auth": body.keys.get("auth", "")}, "added_at": datetime.utcnow()}
     uid = ObjectId(current_user["_id"])
+    # One phone = one account. If someone else was logged in on this phone
+    # before (an admin testing, a shared family phone), stop sending THEIR
+    # alerts here, or the phone rings for an account that isn't signed in.
+    users_collection.update_many({"_id": {"$ne": uid}, "push_subscriptions.endpoint": body.endpoint},
+                                 {"$pull": {"push_subscriptions": {"endpoint": body.endpoint}}})
     users_collection.update_one({"_id": uid}, {"$pull": {"push_subscriptions": {"endpoint": body.endpoint}}})
     # Keep the 5 most recent devices per person.
     users_collection.update_one({"_id": uid}, {"$push": {"push_subscriptions": {"$each": [sub], "$slice": -5}}})
