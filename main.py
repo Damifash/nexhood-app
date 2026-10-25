@@ -171,7 +171,7 @@ if JWT_SECRET == "your-secret-key":
     )
 ALGORITHM = "HS256"
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
-RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "Nexhood <notifications@nexhoodapp.com>")
+RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "NexHood <notifications@nexhoodapp.com>")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 LOGIN_URL = f"{FRONTEND_URL}/login"
 POLICE_EMAIL = os.getenv("POLICE_EMAIL")  # fallback; admins can set per-estate in Settings
@@ -961,7 +961,7 @@ async def location_update(sid, data):
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-BUILD_VERSION = "v41-2026-10-25-profile-edit-post-delete"
+BUILD_VERSION = "v42-2026-10-25-route-fix-ui-polish"
 
 
 @app.get("/health")
@@ -1261,7 +1261,7 @@ async def submit_contact(msg: ContactMessageCreate):
 
     send_email(
         CONTACT_EMAIL,
-        f"New Nexhood contact form message from {msg.name}",
+        f"New NexHood contact form message from {msg.name}",
         branded_email(
             "New contact form submission",
             f"<p><strong>From:</strong> {html.escape(msg.name)} ({html.escape(msg.email)})</p>"
@@ -1271,11 +1271,11 @@ async def submit_contact(msg: ContactMessageCreate):
     )
     send_email(
         msg.email,
-        "We got your message — Nexhood",
+        "We got your message — NexHood",
         branded_email(
             "Thanks for reaching out",
             f"<p>Hi {html.escape(msg.name)},</p>"
-            f"<p>Thanks for reaching out to Nexhood — we've received your message and will get back to you soon.</p>"
+            f"<p>Thanks for reaching out to NexHood — we've received your message and will get back to you soon.</p>"
             f"<p style='color:#9ca3af;font-size:12px;border-left:2px solid #e5e7eb;padding-left:10px;'>{html.escape(msg.message)}</p>"
         )
     )
@@ -2019,7 +2019,7 @@ async def resolve_alert(alert_id: str, current_user: Dict = Depends(get_current_
         where = alert.get("sender_apartment") or "their house"
         asyncio.create_task(asyncio.to_thread(_push_to_users,
             {"estate_id": alert["estate_id"], "role": {"$in": ["guard", "admin", "super_admin"]}, "is_active": True},
-            {"kind": "cancel", "title": f"✅ Alert called off · {where}",
+            {"kind": "cancel", "title": f"Alert called off · {where}",
              "body": f"{current_user.get('name', 'The resident')} says they are safe and cancelled the alert.",
              "url": "/app/alerts", "tag": f"alert-{alert['_id']}"}))
     updated_alert = alerts_collection.find_one({"_id": ObjectId(alert_id)})
@@ -2145,8 +2145,13 @@ async def police_integration(data: PoliceIntegration, current_user: Dict = Depen
 
 
 @app.get("/api/users")
-async def get_users(current_user: Dict = Depends(require_admin)):
-    query_filter = {"estate_id": ObjectId(current_user["estate_id"]), "is_active": True}
+async def get_users(include_blocked: bool = False, current_user: Dict = Depends(require_admin)):
+    # Default (unchanged): active people only — unit pickers, approver lists
+    # etc. rely on that. The Users page passes include_blocked=true so an
+    # admin can still find a blocked person and allow them back in.
+    query_filter = {"estate_id": ObjectId(current_user["estate_id"])}
+    if not include_blocked:
+        query_filter["is_active"] = True
     users = list(users_collection.find(query_filter).sort("created_at", -1))
     return [serialize_doc({"id": str(u["_id"]), **{k: v for k, v in u.items() if k not in SENSITIVE_USER_FIELDS}}) for u in users]
 
@@ -2159,6 +2164,94 @@ async def get_users(current_user: Dict = Depends(require_admin)):
 # strings, meaning any ordinary estate admin could grant themselves or
 # anyone else full platform-wide access with a single request.
 ASSIGNABLE_ROLES = {"resident", "guard", "admin", "police"}
+
+
+# Must stay ABOVE @app.patch("/api/users/{user_id}"): FastAPI matches routes
+# in the order they are defined, and "/api/users/{user_id}" also matches
+# "/api/users/me". When this lived further down, every profile save hit the
+# admin route with user_id="me" (403 for residents, 404 for admins).
+@app.patch("/api/users/me")
+async def update_my_profile(update: ProfileUpdate, current_user: Dict = Depends(get_current_user)):
+    """Self-serve profile edits — name, phone, email, apartment. Always the
+    caller's own account (the id comes from the token, never the request),
+    and nothing here touches role, estate_id or the estate's admin_id; those
+    stay admin-controlled. Changing email needs the current password, and
+    the old address gets a notice. Login and password reset look users up by
+    the email on this document, so they follow the new address immediately.
+
+    Everywhere else in the app refers to this person by user id, and names
+    shown in posts/alerts/incidents/etc. are looked up live (see
+    _refresh_people), so a rename shows up everywhere without rewriting any
+    old records."""
+    changes = update.dict(exclude_unset=True, exclude_none=True, exclude={"current_password"})
+    if not changes:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+
+    uid = ObjectId(current_user["_id"])
+    old_email = current_user.get("email") or ""
+    email_changed = "email" in changes and normalize_email(changes["email"]) != old_email.lower()
+    if "email" in changes:
+        changes["email"] = normalize_email(changes["email"])
+        if not email_changed:
+            changes.pop("email")
+    if email_changed:
+        if not verify_password(update.current_password or "", current_user["password"]):
+            raise HTTPException(status_code=400, detail="Enter your current password to change your email")
+        dup_query = email_query(changes["email"])
+        dup_query["_id"] = {"$ne": uid}
+        if users_collection.find_one(dup_query):
+            raise HTTPException(status_code=400, detail="That email is already in use")
+        _rate_limit(f"email-change:{uid}", 3, 86400, "You've changed your email a few times today. Please try again tomorrow.")
+
+    if "name" in changes:
+        if changes["name"] == current_user.get("name"):
+            changes.pop("name")
+        else:
+            _rate_limit(f"name-change:{uid}", 5, 86400, "You've changed your name a few times today. Please try again tomorrow.")
+
+    if not changes:
+        return await get_my_profile(current_user)
+
+    update_ops: Dict = {"$set": changes}
+    if email_changed:
+        # A reset link already sent to the old inbox must not keep working.
+        update_ops["$unset"] = {"reset_token": "", "reset_token_expires": ""}
+    users_collection.update_one({"_id": uid}, update_ops)
+
+    if email_changed:
+        send_email(
+            old_email,
+            "Your NexHood email was changed",
+            branded_email(
+                "Email address changed",
+                f"<p>Hi {html.escape(current_user.get('name', ''))},</p>"
+                f"<p>The login email on your NexHood account was just changed from "
+                f"<strong>{html.escape(old_email)}</strong> to <strong>{html.escape(changes['email'])}</strong>. "
+                f"From now on, use the new address to log in and to reset your password.</p>"
+                f"<p>If this was you, no action is needed.</p>"
+                f"<p style='color:#b91c1c;font-weight:600;'>If you didn't make this change, "
+                f"contact your estate admin immediately — your account may be compromised.</p>"
+            )
+        )
+
+    updated = users_collection.find_one({"_id": ObjectId(current_user["_id"])})
+    user_data = serialize_doc({k: v for k, v in updated.items() if k not in SENSITIVE_USER_FIELDS})
+    if updated.get("estate_id"):
+        estate = estates_collection.find_one({"_id": ObjectId(updated["estate_id"])})
+        if estate:
+            user_data["estate_name"] = estate.get("name")
+
+    audit_logs_collection.insert_one({
+        "user_id": ObjectId(current_user["_id"]),
+        "estate_id": ObjectId(current_user["estate_id"]) if current_user.get("estate_id") else None,
+        "action": "update",
+        "entity": "user_profile",
+        "entity_id": str(current_user["_id"]),
+        "details": {**changes, "previous": {k: current_user.get(k) for k in ("name", "email") if k in changes}},
+        "timestamp": datetime.utcnow()
+    })
+
+    return user_data
 
 
 @app.patch("/api/users/{user_id}")
@@ -3512,90 +3605,6 @@ async def accept_terms(body: AcceptTermsBody, current_user: Dict = Depends(get_c
     users_collection.update_one({"_id": ObjectId(current_user["_id"])}, {"$set": {
         "terms_accepted_version": TERMS_VERSION, "terms_accepted_at": datetime.utcnow()}})
     return await get_my_profile(users_collection.find_one({"_id": ObjectId(current_user["_id"])}))
-
-
-@app.patch("/api/users/me")
-async def update_my_profile(update: ProfileUpdate, current_user: Dict = Depends(get_current_user)):
-    """Self-serve profile edits — name, phone, email, apartment. Always the
-    caller's own account (the id comes from the token, never the request),
-    and nothing here touches role, estate_id or the estate's admin_id; those
-    stay admin-controlled. Changing email needs the current password, and
-    the old address gets a notice. Login and password reset look users up by
-    the email on this document, so they follow the new address immediately.
-
-    Everywhere else in the app refers to this person by user id, and names
-    shown in posts/alerts/incidents/etc. are looked up live (see
-    _refresh_people), so a rename shows up everywhere without rewriting any
-    old records."""
-    changes = update.dict(exclude_unset=True, exclude_none=True, exclude={"current_password"})
-    if not changes:
-        raise HTTPException(status_code=400, detail="Nothing to update")
-
-    uid = ObjectId(current_user["_id"])
-    old_email = current_user.get("email") or ""
-    email_changed = "email" in changes and normalize_email(changes["email"]) != old_email.lower()
-    if "email" in changes:
-        changes["email"] = normalize_email(changes["email"])
-        if not email_changed:
-            changes.pop("email")
-    if email_changed:
-        if not verify_password(update.current_password or "", current_user["password"]):
-            raise HTTPException(status_code=400, detail="Enter your current password to change your email")
-        dup_query = email_query(changes["email"])
-        dup_query["_id"] = {"$ne": uid}
-        if users_collection.find_one(dup_query):
-            raise HTTPException(status_code=400, detail="That email is already in use")
-        _rate_limit(f"email-change:{uid}", 3, 86400, "You've changed your email a few times today. Please try again tomorrow.")
-
-    if "name" in changes:
-        if changes["name"] == current_user.get("name"):
-            changes.pop("name")
-        else:
-            _rate_limit(f"name-change:{uid}", 5, 86400, "You've changed your name a few times today. Please try again tomorrow.")
-
-    if not changes:
-        return await get_my_profile(current_user)
-
-    update_ops: Dict = {"$set": changes}
-    if email_changed:
-        # A reset link already sent to the old inbox must not keep working.
-        update_ops["$unset"] = {"reset_token": "", "reset_token_expires": ""}
-    users_collection.update_one({"_id": uid}, update_ops)
-
-    if email_changed:
-        send_email(
-            old_email,
-            "Your NexHood email was changed",
-            branded_email(
-                "Email address changed",
-                f"<p>Hi {html.escape(current_user.get('name', ''))},</p>"
-                f"<p>The login email on your NexHood account was just changed from "
-                f"<strong>{html.escape(old_email)}</strong> to <strong>{html.escape(changes['email'])}</strong>. "
-                f"From now on, use the new address to log in and to reset your password.</p>"
-                f"<p>If this was you, no action is needed.</p>"
-                f"<p style='color:#b91c1c;font-weight:600;'>If you didn't make this change, "
-                f"contact your estate admin immediately — your account may be compromised.</p>"
-            )
-        )
-
-    updated = users_collection.find_one({"_id": ObjectId(current_user["_id"])})
-    user_data = serialize_doc({k: v for k, v in updated.items() if k not in SENSITIVE_USER_FIELDS})
-    if updated.get("estate_id"):
-        estate = estates_collection.find_one({"_id": ObjectId(updated["estate_id"])})
-        if estate:
-            user_data["estate_name"] = estate.get("name")
-
-    audit_logs_collection.insert_one({
-        "user_id": ObjectId(current_user["_id"]),
-        "estate_id": ObjectId(current_user["estate_id"]) if current_user.get("estate_id") else None,
-        "action": "update",
-        "entity": "user_profile",
-        "entity_id": str(current_user["_id"]),
-        "details": {**changes, "previous": {k: current_user.get(k) for k in ("name", "email") if k in changes}},
-        "timestamp": datetime.utcnow()
-    })
-
-    return user_data
 
 
 @app.patch("/api/users/me/password")
@@ -5378,11 +5387,11 @@ def _alert_push_payload(a: Dict, level: int) -> Dict:
     where = a.get("sender_apartment") or "location not on file"
     who = a.get("sender_name") or "A resident"
     if level == 0:
-        title = f"🚨 {label} · {where}"
+        title = f"EMERGENCY: {label} · {where}"
         body = f"{who} needs help. Tap to respond." + (f" “{a.get('message')}”" if a.get("message") else "")
     else:
         mins = 1 if level == 1 else 3
-        title = f"🚨 NO ONE HAS RESPONDED ({mins} min) · {where}"
+        title = f"STILL NO RESPONSE ({mins} min): {label} · {where}"
         body = f"{label} from {who} is still unanswered. Tap to respond now."
     return {"kind": "alert", "title": title, "body": body, "url": "/app/alerts", "tag": f"alert-{a['_id']}",
             "alert_id": str(a["_id"]), "level": level, "drill": bool(a.get("is_drill"))}
