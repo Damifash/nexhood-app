@@ -510,14 +510,41 @@ class UserInvite(BaseModel):
             raise ValueError(str(e))
 
 
+PROFILE_NAME_MAX = 80
+
+
+def clean_display_name(raw: str) -> str:
+    """Names are shown to the whole estate (feed, alerts, gate screens) and
+    dropped into emails, so strip anything tag-like and collapse whitespace
+    before storing. React escapes on render anyway; this keeps the stored
+    value itself clean."""
+    v = re.sub(r"<[^>]*>", "", raw or "")
+    v = re.sub(r"[<>]", "", v)
+    v = re.sub(r"[\x00-\x1f\x7f]", "", v)
+    return re.sub(r"\s+", " ", v).strip()
+
+
 class ProfileUpdate(BaseModel):
     """Self-serve edits from Settings — deliberately a small allowlist
-    (name, phone, email, apartment). Role/estate changes stay admin-only."""
-    name: Optional[str] = Field(None, min_length=2)
+    (name, phone, email, apartment). Role/estate changes stay admin-only.
+    Any other field sent (estate_id, role, ...) is ignored by Pydantic."""
+    name: Optional[str] = None
     phone: Optional[str] = None
     email: Optional[EmailStr] = None
     apartment: Optional[str] = Field(None, max_length=60)
     current_password: Optional[str] = None
+
+    @field_validator("name")
+    @classmethod
+    def _clean_name(cls, v):
+        if v is None:
+            return None
+        v = clean_display_name(v)
+        if len(v) < 2:
+            raise ValueError("Name must be at least 2 characters")
+        if len(v) > PROFILE_NAME_MAX:
+            raise ValueError(f"Name can be at most {PROFILE_NAME_MAX} characters")
+        return v
 
     @field_validator("phone")
     @classmethod
@@ -766,6 +793,87 @@ def _rate_limit(key: str, limit: int, window_seconds: int, message: str = "You'r
     _rate_buckets[key] = bucket
 
 
+def _live_people(ids, want_location: bool) -> Dict[ObjectId, Dict]:
+    """Current name / phone / house for each user id. The house follows the
+    same rule as _alert_location_label: the linked unit's label first, else
+    the apartment typed on the profile."""
+    people = {u["_id"]: {"name": u.get("name"), "phone": u.get("phone"), "location": (u.get("apartment") or "").strip() or None}
+              for u in users_collection.find({"_id": {"$in": list(ids)}}, {"name": 1, "phone": 1, "apartment": 1})}
+    if want_location and people:
+        by_payer = {}
+        for unit in units_collection.find({"active": True, "$or": [{"occupant_user_ids": {"$in": list(people)}},
+                                                                   {"payer_user_id": {"$in": list(people)}}]},
+                                          {"label": 1, "occupant_user_ids": 1, "payer_user_id": 1}):
+            if not unit.get("label"):
+                continue
+            for uid in unit.get("occupant_user_ids") or []:
+                if uid in people:
+                    people[uid]["_unit"] = unit["label"]
+            if unit.get("payer_user_id") in people:
+                by_payer.setdefault(unit["payer_user_id"], unit["label"])
+        for uid, p in people.items():
+            p["location"] = p.pop("_unit", None) or by_payer.get(uid) or p["location"]
+    return people
+
+
+def _refresh_people(docs: List[Dict], pairs: List[Tuple[str, Dict[str, str]]] = (),
+                    nested: List[Tuple[str, str, Dict[str, str]]] = ()) -> List[Dict]:
+    """Posts, alerts, incidents, passes, payments etc. store a copy of the
+    person's name, phone and house/flat from the moment they were created.
+    Before sending them out, swap each copy for the person's CURRENT details,
+    looked up by the user id stored next to it, so a profile edit shows up
+    everywhere at once.
+
+    pairs:  (id_field, {copied_field: "name" | "phone" | "location"}),
+            e.g. ("author_id", {"author_name": "name", "author_apartment": "location"})
+    nested: (list_field, id_field, {copied_field: ...}) for embedded lists,
+            e.g. ("replies", "author_id", {...})
+
+    Only fields the record already has are replaced (nothing new is added),
+    and only in memory; nothing is written back. If the account no longer
+    exists, the stored copies are kept. A phone or house the person has since
+    cleared shows as empty; a name is never blanked."""
+    ids = set()
+    for d in docs:
+        for id_f, _ in pairs:
+            if isinstance(d.get(id_f), ObjectId):
+                ids.add(d[id_f])
+        for list_f, id_f, _ in nested:
+            for item in d.get(list_f) or []:
+                if isinstance(item, dict) and isinstance(item.get(id_f), ObjectId):
+                    ids.add(item[id_f])
+    if not ids:
+        return docs
+    want_location = any("location" in fm.values() for _, fm in pairs) or any("location" in fm.values() for _, _, fm in nested)
+    people = _live_people(ids, want_location)
+
+    def apply(target: Dict, uid, field_map: Dict[str, str]):
+        person = people.get(uid)
+        if not person:
+            return
+        for doc_f, live_f in field_map.items():
+            if doc_f in target and (person.get(live_f) or live_f != "name"):
+                target[doc_f] = person.get(live_f)
+
+    for d in docs:
+        for id_f, field_map in pairs:
+            apply(d, d.get(id_f), field_map)
+        for list_f, id_f, field_map in nested:
+            for item in d.get(list_f) or []:
+                if isinstance(item, dict):
+                    apply(item, item.get(id_f), field_map)
+    return docs
+
+
+_AUTHOR = {"author_name": "name", "author_apartment": "location"}
+ALERT_PEOPLE = dict(pairs=[("sender_id", {"sender_name": "name", "sender_phone": "phone", "sender_apartment": "location"})],
+                    nested=[("acknowledged_by", "user_id", {"name": "name", "phone": "phone"})])
+POST_PEOPLE = dict(pairs=[("author_id", _AUTHOR)], nested=[("replies", "author_id", _AUTHOR)])
+INCIDENT_PEOPLE = dict(pairs=[("reporter_id", {"reporter_name": "name", "reporter_phone": "phone"})])
+PASS_PEOPLE = dict(pairs=[("host_id", {"host_name": "name", "host_apartment": "location"})])
+REPAIR_PEOPLE = dict(pairs=[("reporter_id", {"reporter_name": "name", "reporter_unit": "location"})])
+
+
 def require_admin(current_user: Dict = Depends(get_current_user)):
     if current_user["role"] not in ["admin", "super_admin"]:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -853,7 +961,7 @@ async def location_update(sid, data):
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-BUILD_VERSION = "v40-2026-10-19-first-login"
+BUILD_VERSION = "v41-2026-10-25-profile-edit-post-delete"
 
 
 @app.get("/health")
@@ -1643,8 +1751,8 @@ async def get_incidents(status: Optional[str] = None, type: Optional[str] = None
             query_filter["created_at"] = {"$gte": datetime.fromisoformat(start_date), "$lte": datetime.fromisoformat(end_date)}
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid date format")
-    incidents = incidents_collection.find(query_filter).sort("created_at", -1).limit(100)
-    return [serialize_doc(i) for i in incidents]
+    incidents = list(incidents_collection.find(query_filter).sort("created_at", -1).limit(100))
+    return [serialize_doc(i) for i in _refresh_people(incidents, **INCIDENT_PEOPLE)]
 
 
 @app.get("/api/incidents/{incident_id}")
@@ -1653,7 +1761,7 @@ async def get_incident(incident_id: str, current_user: Dict = Depends(get_curren
     incident = incidents_collection.find_one({"_id": ObjectId(incident_id)})
     if not incident or str(incident.get("estate_id")) != str(current_user["estate_id"]):
         raise HTTPException(status_code=404, detail="Incident not found")
-    return serialize_doc(incident)
+    return serialize_doc(_refresh_people([incident], **INCIDENT_PEOPLE)[0])
 
 
 @app.patch("/api/incidents/{incident_id}")
@@ -1945,8 +2053,8 @@ async def get_alerts(status: Optional[str] = None, type: Optional[str] = None, p
             query_filter["created_at"] = {"$gte": datetime.fromisoformat(start_date), "$lte": datetime.fromisoformat(end_date)}
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid date format")
-    alerts = alerts_collection.find(query_filter).sort("created_at", -1).limit(100)
-    return [serialize_doc(a) for a in alerts]
+    alerts = list(alerts_collection.find(query_filter).sort("created_at", -1).limit(100))
+    return [serialize_doc(a) for a in _refresh_people(alerts, **ALERT_PEOPLE)]
 
 
 @app.post("/api/police/integration")
@@ -2390,18 +2498,20 @@ def build_estate_feed(estate_filter: Dict, since: datetime, limit: int = 30) -> 
     items: List[Dict] = []
     name_cache: Dict = {}
 
-    def user_name(uid):
+    def user_name(uid, stored: Optional[str] = None):
+        """The person's current name by id; the name copied onto the record
+        is only used if the account no longer exists."""
         if not uid:
-            return "Someone"
+            return stored or "Someone"
         if uid not in name_cache:
             u = users_collection.find_one({"_id": uid}, {"name": 1})
-            name_cache[uid] = (u or {}).get("name") or "A former resident"
-        return name_cache[uid]
+            name_cache[uid] = (u or {}).get("name")
+        return name_cache[uid] or stored or "A former resident"
 
     for p in passes_collection.find({**estate_filter, "$or": [{"created_at": {"$gte": since}}, {"used_at": {"$gte": since}}]},
                                     {"visitor_name": 1, "host_name": 1, "host_id": 1, "created_at": 1, "used_at": 1, "status": 1}).limit(200):
         visitor = p.get("visitor_name") or "a visitor"
-        host = p.get("host_name") or user_name(p.get("host_id"))
+        host = user_name(p.get("host_id"), p.get("host_name"))
         if p.get("created_at") and p["created_at"] >= since:
             items.append({"kind": "pass_created", "at": p["created_at"], "link": "/app/visitor-passes",
                           "actor": host, "text": f"created a visitor pass for {visitor}"})
@@ -2415,7 +2525,7 @@ def build_estate_feed(estate_filter: Dict, since: datetime, limit: int = 30) -> 
         link = f"/app/incidents/{i['_id']}"
         if i.get("created_at") and i["created_at"] >= since:
             items.append({"kind": "incident", "at": i["created_at"], "link": link, "level": i.get("severity"),
-                          "actor": i.get("reporter_name") or user_name(i.get("reporter_id")),
+                          "actor": user_name(i.get("reporter_id"), i.get("reporter_name")),
                           "text": f"reported \u201c{title}\u201d ({i.get('severity', 'medium')})"})
         if i.get("resolved_at") and i["resolved_at"] >= since:
             items.append({"kind": "incident_resolved", "at": i["resolved_at"], "link": link,
@@ -2427,12 +2537,12 @@ def build_estate_feed(estate_filter: Dict, since: datetime, limit: int = 30) -> 
         label = ALERT_TYPE_LABEL.get(a.get("type"), "an")
         if a.get("created_at") and a["created_at"] >= since:
             items.append({"kind": "alert", "at": a["created_at"], "link": "/app/alerts", "level": "critical",
-                          "actor": a.get("sender_name") or user_name(a.get("sender_id")),
+                          "actor": user_name(a.get("sender_id"), a.get("sender_name")),
                           "text": f"raised a {label} alert"})
         for ack in (a.get("acknowledged_by") or []):
             if ack.get("timestamp") and ack["timestamp"] >= since:
                 items.append({"kind": "alert_ack", "at": ack["timestamp"], "link": "/app/alerts",
-                              "actor": user_name(ack.get("user_id")), "text": f"responded to the {label} alert"})
+                              "actor": user_name(ack.get("user_id"), ack.get("name")), "text": f"responded to the {label} alert"})
         if a.get("police_notified_at") and a["police_notified_at"] >= since:
             items.append({"kind": "police", "at": a["police_notified_at"], "link": "/app/alerts",
                           "actor": "", "text": f"Police were notified about the {label} alert"})
@@ -2441,12 +2551,12 @@ def build_estate_feed(estate_filter: Dict, since: datetime, limit: int = 30) -> 
                           "actor": user_name(a.get("resolved_by")) if a.get("resolved_by") else "",
                           "text": f"resolved the {label} alert" if a.get("resolved_by") else f"The {label} alert was resolved"})
 
-    for po in posts_collection.find({**estate_filter, "created_at": {"$gte": since}}, {"author_name": 1, "type": 1, "content": 1, "created_at": 1}).limit(100):
+    for po in posts_collection.find({**estate_filter, "created_at": {"$gte": since}}, {"author_id": 1, "author_name": 1, "type": 1, "content": 1, "created_at": 1}).limit(100):
         preview = (po.get("content") or "").strip().replace("\n", " ")
         preview = preview[:60] + ("\u2026" if len(preview) > 60 else "")
         what = {"event": "posted an event", "appreciation": "shared an appreciation post"}.get(po.get("type"), "posted in Community")
         items.append({"kind": "post", "at": po["created_at"], "link": "/app/community",
-                      "actor": po.get("author_name") or "Someone", "text": f"{what}: \u201c{preview}\u201d"})
+                      "actor": user_name(po.get("author_id"), po.get("author_name")), "text": f"{what}: \u201c{preview}\u201d"})
 
     for u in users_collection.find({**estate_filter, "created_at": {"$gte": since}}, {"name": 1, "role": 1, "created_at": 1}).limit(100):
         items.append({"kind": "joined", "at": u["created_at"], "link": "/app/users",
@@ -2463,7 +2573,7 @@ def build_admin_log(estate_filter: Dict, since: datetime, limit: int = 40) -> Li
         {**estate_filter, "timestamp": {"$gte": since},
          "action": {"$in": ["invite", "delete", "role_change", "update", "update_settings", "verify", "edit_content",
                             "issue_bills", "confirm_payment", "create", "approve", "void", "update_finance_settings"]},
-         "entity": {"$in": ["user", "estate", "donation", "incident", "charge", "payment", "expense"]}},
+         "entity": {"$in": ["user", "estate", "donation", "incident", "charge", "payment", "expense", "post"]}},
         {"user_id": 1, "action": 1, "entity": 1, "entity_id": 1, "details": 1, "timestamp": 1}
     ).sort("timestamp", -1).limit(limit))
     ids = set()
@@ -2511,6 +2621,10 @@ def build_admin_log(estate_filter: Dict, since: datetime, limit: int = 40) -> Li
             text = f"confirmed a \u20a6{amt:,.0f} welfare pledge" if isinstance(amt, (int, float)) else "confirmed a welfare pledge"
         elif ent == "incident" and act == "edit_content":
             text = "edited an incident report"
+        elif ent == "post" and act == "delete":
+            if not d.get("moderated"):
+                continue  # people deleting their own posts isn't an admin action
+            text = "removed a community post"
         elif ent == "charge" and act == "issue_bills":
             text = f"issued {d.get('count', 0)} \u201c{d.get('name', 'estate')}\u201d bills for {d.get('period', '')}"
         elif ent == "payment" and act == "confirm_payment":
@@ -2861,7 +2975,8 @@ async def get_dashboard(days: int = 30, current_user: Dict = Depends(get_current
     # Nigeria is UTC+1: "today" runs from local midnight.
     local_midnight = (now + timedelta(hours=1)).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(hours=1)
     open_alerts = list(alerts_collection.find({"estate_id": estate_id, "status": {"$in": ["active", "acknowledged"]}},
-                                              {"type": 1, "status": 1, "created_at": 1, "sender_name": 1, "message": 1, "acknowledged_by": 1}).sort("created_at", -1).limit(10))
+                                              {"type": 1, "status": 1, "created_at": 1, "sender_id": 1, "sender_name": 1, "message": 1, "acknowledged_by": 1}).sort("created_at", -1).limit(10))
+    _refresh_people(open_alerts, **ALERT_PEOPLE)
     base = {
         "role": role,
         "summary": {
@@ -2896,6 +3011,9 @@ async def get_dashboard(days: int = 30, current_user: Dict = Depends(get_current
         overdue = invoices_collection.count_documents({"unit_id": {"$in": [u["_id"] for u in units]}, "status": {"$in": ["unpaid", "part_paid"]}, "due_date": {"$lt": now}})
         base["bills"] = {"has_unit": bool(units), "balance_due": due, "overdue_bills": overdue,
                          "credit": sum(int(u.get("credit", 0)) for u in units)}
+    _refresh_people(base["recentIncidents"], **INCIDENT_PEOPLE)
+    _refresh_people((base.get("gate") or {}).get("expected", []) + (base.get("gate") or {}).get("arrived", [])
+                   + base.get("my_passes", []), **PASS_PEOPLE)
     return serialize_doc(base)
 
 
@@ -3078,8 +3196,8 @@ async def get_visitor_passes(status: Optional[str] = None, start_date: Optional[
             raise HTTPException(status_code=400, detail="Invalid date format")
 
     projection = {"qr_code": 0} if current_user["role"].lower() == "guard" else None
-    passes = passes_collection.find(query_filter, projection).sort("created_at", -1).limit(100)
-    return [serialize_doc(p) for p in passes]
+    passes = list(passes_collection.find(query_filter, projection).sort("created_at", -1).limit(100))
+    return [serialize_doc(p) for p in _refresh_people(passes, **PASS_PEOPLE)]
 
 
 @app.post("/api/community/posts")
@@ -3131,7 +3249,7 @@ async def create_post(post: PostCreate, background_tasks: BackgroundTasks, curre
 @app.get("/api/community/posts")
 async def get_posts(current_user: Dict = Depends(get_current_user)):
     posts = list(posts_collection.find({"estate_id": ObjectId(current_user["estate_id"])}).sort("created_at", -1))
-    return [serialize_doc(post) for post in posts]
+    return [serialize_doc(post) for post in _refresh_people(posts, **POST_PEOPLE)]
 
 
 @app.post("/api/community/posts/{post_id}/reply")
@@ -3187,6 +3305,39 @@ async def like_post(post_id: str, current_user: Dict = Depends(get_current_user)
 
     await sio.emit("post_update", {"id": post_id, "likes": new_likes}, room=f"estate_{current_user['estate_id']}")
     return {"message": "Like updated", "likes": new_likes}
+
+
+@app.delete("/api/community/posts/{post_id}")
+async def delete_post(post_id: str, current_user: Dict = Depends(get_current_user)):
+    """The author can delete their own post; an estate admin can delete any
+    post in THEIR estate (moderation). Nobody can touch another estate's
+    posts — the lookup itself is scoped to the caller's estate, so a post
+    from elsewhere is simply "not found", even for an admin.
+
+    Replies and photos live inside the post document itself (no separate
+    collection or file storage), so deleting the document frees all of it."""
+    post = posts_collection.find_one({"_id": ObjectId(post_id), "estate_id": ObjectId(current_user["estate_id"])},
+                                     {"author_id": 1, "type": 1, "replies": 1, "images": 1})
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    is_author = post.get("author_id") == ObjectId(current_user["_id"])
+    is_estate_admin = current_user["role"] in ("admin", "super_admin")
+    if not is_author and not is_estate_admin:
+        raise HTTPException(status_code=403, detail="You can only delete your own posts")
+    posts_collection.delete_one({"_id": post["_id"]})
+    await sio.emit("post_deleted", {"id": post_id}, room=f"estate_{current_user['estate_id']}")
+    audit_logs_collection.insert_one({
+        "user_id": ObjectId(current_user["_id"]),
+        "estate_id": ObjectId(current_user["estate_id"]),
+        "action": "delete",
+        "entity": "post",
+        "entity_id": post_id,
+        # Counts only — the content and photos are deliberately not copied here.
+        "details": {"author_id": post.get("author_id"), "type": post.get("type"), "moderated": not is_author,
+                    "reply_count": len(post.get("replies") or []), "image_count": len(post.get("images") or [])},
+        "timestamp": datetime.utcnow()
+    })
+    return {"message": "Post deleted"}
 
 
 @app.post("/api/welfare/campaigns")
@@ -3280,7 +3431,7 @@ async def list_pending_donations(current_user: Dict = Depends(require_admin)):
     about why this has to be manual for now."""
     estate_id = ObjectId(current_user["estate_id"])
     donations = list(donations_collection.find({"estate_id": estate_id, "status": "pending"}).sort("timestamp", -1))
-    return [serialize_doc({**d, "id": str(d["_id"])}) for d in donations]
+    return [serialize_doc({**d, "id": str(d["_id"])}) for d in _refresh_people(donations, [("user_id", {"donor_name": "name"})])]
 
 
 @app.patch("/api/welfare/donations/{donation_id}/verify")
@@ -3365,26 +3516,67 @@ async def accept_terms(body: AcceptTermsBody, current_user: Dict = Depends(get_c
 
 @app.patch("/api/users/me")
 async def update_my_profile(update: ProfileUpdate, current_user: Dict = Depends(get_current_user)):
-    """Self-serve profile edits — name, phone, email, apartment. Nothing
-    here touches role or estate membership; those stay admin-controlled.
-    Changing email just updates the login address on this same account, no
-    re-verification flow yet (matches how the rest of the app currently
-    trusts email at signup)."""
+    """Self-serve profile edits — name, phone, email, apartment. Always the
+    caller's own account (the id comes from the token, never the request),
+    and nothing here touches role, estate_id or the estate's admin_id; those
+    stay admin-controlled. Changing email needs the current password, and
+    the old address gets a notice. Login and password reset look users up by
+    the email on this document, so they follow the new address immediately.
+
+    Everywhere else in the app refers to this person by user id, and names
+    shown in posts/alerts/incidents/etc. are looked up live (see
+    _refresh_people), so a rename shows up everywhere without rewriting any
+    old records."""
     changes = update.dict(exclude_unset=True, exclude_none=True, exclude={"current_password"})
     if not changes:
         raise HTTPException(status_code=400, detail="Nothing to update")
 
+    uid = ObjectId(current_user["_id"])
+    old_email = current_user.get("email") or ""
+    email_changed = "email" in changes and normalize_email(changes["email"]) != old_email.lower()
     if "email" in changes:
         changes["email"] = normalize_email(changes["email"])
-        if changes["email"] != current_user["email"].lower() and not verify_password(update.current_password or "", current_user["password"]):
+        if not email_changed:
+            changes.pop("email")
+    if email_changed:
+        if not verify_password(update.current_password or "", current_user["password"]):
             raise HTTPException(status_code=400, detail="Enter your current password to change your email")
-        if changes["email"] != current_user["email"].lower():
-            dup_query = email_query(changes["email"])
-            dup_query["_id"] = {"$ne": ObjectId(current_user["_id"])}
-            if users_collection.find_one(dup_query):
-                raise HTTPException(status_code=400, detail="That email is already in use")
+        dup_query = email_query(changes["email"])
+        dup_query["_id"] = {"$ne": uid}
+        if users_collection.find_one(dup_query):
+            raise HTTPException(status_code=400, detail="That email is already in use")
+        _rate_limit(f"email-change:{uid}", 3, 86400, "You've changed your email a few times today. Please try again tomorrow.")
 
-    users_collection.update_one({"_id": ObjectId(current_user["_id"])}, {"$set": changes})
+    if "name" in changes:
+        if changes["name"] == current_user.get("name"):
+            changes.pop("name")
+        else:
+            _rate_limit(f"name-change:{uid}", 5, 86400, "You've changed your name a few times today. Please try again tomorrow.")
+
+    if not changes:
+        return await get_my_profile(current_user)
+
+    update_ops: Dict = {"$set": changes}
+    if email_changed:
+        # A reset link already sent to the old inbox must not keep working.
+        update_ops["$unset"] = {"reset_token": "", "reset_token_expires": ""}
+    users_collection.update_one({"_id": uid}, update_ops)
+
+    if email_changed:
+        send_email(
+            old_email,
+            "Your NexHood email was changed",
+            branded_email(
+                "Email address changed",
+                f"<p>Hi {html.escape(current_user.get('name', ''))},</p>"
+                f"<p>The login email on your NexHood account was just changed from "
+                f"<strong>{html.escape(old_email)}</strong> to <strong>{html.escape(changes['email'])}</strong>. "
+                f"From now on, use the new address to log in and to reset your password.</p>"
+                f"<p>If this was you, no action is needed.</p>"
+                f"<p style='color:#b91c1c;font-weight:600;'>If you didn't make this change, "
+                f"contact your estate admin immediately — your account may be compromised.</p>"
+            )
+        )
 
     updated = users_collection.find_one({"_id": ObjectId(current_user["_id"])})
     user_data = serialize_doc({k: v for k, v in updated.items() if k not in SENSITIVE_USER_FIELDS})
@@ -3399,7 +3591,7 @@ async def update_my_profile(update: ProfileUpdate, current_user: Dict = Depends(
         "action": "update",
         "entity": "user_profile",
         "entity_id": str(current_user["_id"]),
-        "details": changes,
+        "details": {**changes, "previous": {k: current_user.get(k) for k in ("name", "email") if k in changes}},
         "timestamp": datetime.utcnow()
     })
 
@@ -4051,7 +4243,9 @@ async def list_payments(status: Optional[str] = None, current_user: Dict = Depen
         # Unfinished online checkouts (resident closed the Paystack page) aren't payments.
         q["status"] = {"$nin": ["initiated", "confirming"]}
     out = []
-    for p in payments_collection.find(q, {"proof_image": 0}).sort("created_at", -1).limit(300):
+    rows = _refresh_people(list(payments_collection.find(q, {"proof_image": 0}).sort("created_at", -1).limit(300)),
+                          [("payer_user_id", {"payer_name": "name"})])
+    for p in rows:
         d = serialize_doc(p)
         d["has_proof"] = bool(payments_collection.count_documents({"_id": p["_id"], "proof_image": {"$nin": [None, ""]}}))
         out.append(d)
@@ -4181,7 +4375,9 @@ async def list_expenses(month: Optional[str] = None, status: Optional[str] = Non
         end = (start + timedelta(days=32)).replace(day=1)
         q["date"] = {"$gte": start, "$lt": end}
     out = []
-    for e in expenses_collection.find(q, {"receipt_image": 0}).sort("date", -1).limit(500):
+    rows = _refresh_people(list(expenses_collection.find(q, {"receipt_image": 0}).sort("date", -1).limit(500)),
+                          [("created_by", {"created_by_name": "name"}), ("approved_by", {"approved_by_name": "name"})])
+    for e in rows:
         d = serialize_doc(e)
         d["has_receipt"] = bool(expenses_collection.count_documents({"_id": e["_id"], "receipt_image": {"$nin": [None, ""]}}))
         out.append(d)
@@ -4397,7 +4593,8 @@ async def list_repairs(status: Optional[str] = None, current_user: Dict = Depend
         q["status"] = {"$in": ["reported", "assigned", "in_progress"]}
     elif status:
         q["status"] = status
-    return [_repair_out(r, current_user) for r in requests_collection.find(q, {"images": 0}).sort("created_at", -1).limit(200)]
+    rows = _refresh_people(list(requests_collection.find(q, {"images": 0}).sort("created_at", -1).limit(200)), **REPAIR_PEOPLE)
+    return [_repair_out(r, current_user) for r in rows]
 
 
 @app.get("/api/repairs/{repair_id}")
@@ -4405,7 +4602,7 @@ async def get_repair(repair_id: str, current_user: Dict = Depends(get_current_us
     r = requests_collection.find_one({"_id": _oid(repair_id, "request"), "estate_id": _estate_oid(current_user)})
     if not r or (r.get("visibility") == "management" and not _is_admin(current_user) and current_user.get("role") != "guard" and r.get("reporter_id") != current_user["_id"]):
         raise HTTPException(status_code=404, detail="Request not found")
-    return _repair_out(r, current_user)
+    return _repair_out(_refresh_people([r], **REPAIR_PEOPLE)[0], current_user)
 
 
 @app.post("/api/repairs/{repair_id}/me-too")
@@ -5279,7 +5476,7 @@ async def active_alerts(current_user: Dict = Depends(get_current_user)):
     since = datetime.utcnow() - timedelta(hours=24)
     rows = alerts_collection.find({"estate_id": ObjectId(current_user["estate_id"]), "status": {"$in": ["active", "acknowledged"]},
                                    "created_at": {"$gte": since}}).sort("created_at", -1).limit(20)
-    return [serialize_doc(a) for a in rows]
+    return [serialize_doc(a) for a in _refresh_people(list(rows), **ALERT_PEOPLE)]
 
 
 app.mount("/", socketio.ASGIApp(sio, socketio_path="socket.io"))
